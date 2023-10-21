@@ -13,6 +13,7 @@ use zellij_utils::surf::{
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::sync::{
@@ -202,6 +203,7 @@ pub(crate) fn background_jobs_main(
                             }
                             task::sleep(std::time::Duration::from_millis(SESSION_READ_DURATION))
                                 .await;
+                            }
                         }
                     }
                 });
