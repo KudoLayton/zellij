@@ -8,7 +8,7 @@ use std::{
         ffi::OsStrExt,
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr,
     sync::Arc,
 };
@@ -99,7 +99,7 @@ struct PipeAcceptIterator {
 }
 
 impl Pipe {
-    pub fn new(name: impl AsRef<OsStr>) -> Self {
+    pub fn new(name: &Path) -> Self {
         let pipe_name = Pipe::convert_pipe_name(name.as_ref());
         Self {
             pipe_name: Arc::from(pipe_name),
@@ -178,9 +178,13 @@ impl Pipe {
         connected.map(|_| pipe_handle)
     }
 
-    fn convert_pipe_name(name: &OsStr) -> Vec<u16> {
-        let mut pipe_name = OsString::from("\\\\.\\pipe\\");
-        pipe_name.push(name);
+    fn convert_pipe_name(name: &Path) -> Vec<u16> {
+        let mut pipe_name = OsString::from("\\\\.\\pipe\\zellij\\");
+        if let Some(file_name) = name.file_name() {
+            pipe_name.push(file_name);
+        } else {
+            pipe_name.push(name);
+        }
         let mut pipe_name = pipe_name.as_os_str().encode_wide().collect::<Vec<_>>();
         pipe_name.push(0);
 
@@ -235,7 +239,7 @@ impl PipeStream {
         .map(|_| Self::from(dup_handle))
     }
 
-    pub fn connect(path: impl AsRef<OsStr>) -> io::Result<Self> {
+    pub fn connect(path: &Path) -> io::Result<Self> {
         Pipe::new(path).connect()
     }
 }

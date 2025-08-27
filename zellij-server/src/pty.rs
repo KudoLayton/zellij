@@ -1570,7 +1570,6 @@ impl Pty {
         // command
         // successfully opened
 
-        
         let err_context = || format!("failed to apply run instruction");
         let quit_cb = Box::new({
             let senders = self.bus.senders.clone();

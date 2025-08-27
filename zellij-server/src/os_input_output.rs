@@ -2,7 +2,6 @@ use crate::{panes::PaneId, ClientId};
 
 use async_std::io::ReadExt;
 
-
 use std::ffi::OsString;
 use std::io::Error;
 
