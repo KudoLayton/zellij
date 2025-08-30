@@ -16,7 +16,10 @@ use std::{
 use winapi::{
     shared::{
         minwindef::{DWORD, TRUE},
-        winerror::{ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED},
+        winerror::{
+            ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_BUSY,
+            ERROR_PIPE_CONNECTED,
+        },
     },
     um::{
         errhandlingapi::GetLastError,
@@ -24,12 +27,14 @@ use winapi::{
         handleapi::{CloseHandle, DuplicateHandle, INVALID_HANDLE_VALUE},
         ioapiset::GetOverlappedResult,
         minwinbase::OVERLAPPED,
-        namedpipeapi::{ConnectNamedPipe, CreateNamedPipeW},
+        namedpipeapi::{
+            ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, SetNamedPipeHandleState,
+        },
         processthreadsapi::GetCurrentProcess,
         synchapi::CreateEventW,
         winbase::{
-            FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-            PIPE_WAIT,
+            FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE,
+            PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
         },
         winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, HANDLE},
     },
@@ -140,7 +145,7 @@ impl Pipe {
             CreateNamedPipeW(
                 self.pipe_name.as_ptr(),                   // pipe name
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, // read/write access
-                PIPE_TYPE_BYTE |       // message type pipe
+                PIPE_TYPE_MESSAGE |       // message type pipe
                     PIPE_WAIT, // blocking mode
                 PIPE_UNLIMITED_INSTANCES,                  // max. instances
                 BUFSIZE,                                   // output buffer size
@@ -173,6 +178,16 @@ impl Pipe {
 
                 Err(os_error)
             }
+        };
+
+        let mut mode: u32 = PIPE_READMODE_MESSAGE;
+        unsafe {
+            SetNamedPipeHandleState(
+                pipe_handle.0.as_raw_handle(),
+                &mut mode,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
         };
 
         connected.map(|_| pipe_handle)
@@ -242,6 +257,27 @@ impl PipeStream {
     pub fn connect(path: &Path) -> io::Result<Self> {
         Pipe::new(path).connect()
     }
+
+    pub fn left_bytes(&self) -> io::Result<(usize, usize)> {
+        let mut left_bytes: u32 = 0;
+        let mut left_available_bytes: u32 = 0;
+        unsafe {
+            PeekNamedPipe(
+                self.0.as_raw_handle() as _,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut left_available_bytes as *mut u32,
+                &mut left_bytes as *mut u32,
+            );
+        }
+        log::debug!(
+            "{:?} / {:?} readable bytes left",
+            left_bytes,
+            left_available_bytes
+        );
+        Ok((left_bytes as usize, left_available_bytes as usize))
+    }
 }
 
 impl From<HANDLE> for PipeStream {
@@ -253,9 +289,9 @@ impl From<HANDLE> for PipeStream {
 
 impl std::io::Read for PipeStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut overlapped = create_overlapped_with_new_event()?;
         let mut consumed = 0;
-        let result = call_BOOL_with_last_error!(unsafe {
+        let mut overlapped = create_overlapped_with_new_event()?;
+        let mut result = call_BOOL_with_last_error!(unsafe {
             ReadFile(
                 self.0.as_raw_handle() as _,
                 buf.as_mut_ptr() as _,
@@ -266,20 +302,37 @@ impl std::io::Read for PipeStream {
                 &mut overlapped.0,
             )
         });
+
+        let is_pending =
+            matches!(result, Err(ref e) if e.raw_os_error() == Some(ERROR_IO_PENDING as i32));
+
+        if is_pending {
+            result = call_BOOL_with_last_error!(unsafe {
+                GetOverlappedResult(
+                    self.0.as_raw_handle() as _,
+                    &mut overlapped.0 as *mut OVERLAPPED,
+                    &mut consumed,
+                    TRUE,
+                )
+            });
+        }
+
         match result {
             Ok(()) => Ok(consumed as usize),
-            Err(err) if err.raw_os_error() == Some(ERROR_IO_PENDING as i32) => {
-                call_BOOL_with_last_error!(unsafe {
-                    GetOverlappedResult(
-                        self.0.as_raw_handle() as _,
-                        &mut overlapped.0 as *mut OVERLAPPED,
-                        &mut consumed,
-                        TRUE.into(),
-                    )
-                })
-                .map(|_| consumed as usize)
+            Err(err) => {
+                if let Some(code) = err.raw_os_error() {
+                    match code as u32 {
+                        ERROR_MORE_DATA => Ok(buf.len()),
+                        _ => {
+                            log::debug!("Read Pipe Error code - {:?}", code);
+                            Err(err)
+                        },
+                    }
+                } else {
+                    log::debug!("Unhandled pipe error - {:?}", err);
+                    Err(err)
+                }
             },
-            Err(err) => Err(err),
         }
     }
 }
@@ -288,6 +341,7 @@ impl std::io::Write for PipeStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut overlapped = create_overlapped_with_new_event()?;
         let mut consumed = 0;
+        log::debug!("Writing {} bytes to pipe", buf.len());
         let result = call_BOOL_with_last_error!(unsafe {
             WriteFile(
                 self.0.as_raw_handle() as _,
@@ -312,7 +366,10 @@ impl std::io::Write for PipeStream {
                 })
                 .map(|_| consumed as usize)
             },
-            Err(err) => Err(err),
+            Err(err) => {
+                log::error!("Error writing to pipe: {}", err);
+                Err(err)
+            },
         }
     }
 

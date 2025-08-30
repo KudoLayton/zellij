@@ -13,6 +13,9 @@ use crate::{
     pane_size::{Size, SizeInPixels},
 };
 
+#[cfg(windows)]
+use winapi::shared::winerror::ERROR_MORE_DATA;
+
 #[cfg(unix)]
 use crate::shared::set_permissions;
 
@@ -28,6 +31,8 @@ use std::{
     io::{self, Read, Write},
     marker::PhantomData,
     path::Path,
+    thread::sleep,
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -295,7 +300,11 @@ impl<T: Serialize> IpcSenderWithContext<T> {
     pub fn send(&mut self, msg: T) -> Result<()> {
         log::debug!("Sending message");
         let err_ctx = get_current_ctx();
-        let result = if rmp_serde::encode::write(&mut self.sender, &(msg, err_ctx)).is_err() {
+        let data = (msg, err_ctx);
+        if let Ok(test_result) = rmp_serde::encode::to_vec(&data) {
+            log::debug!("Writing {} bytes to pipe", test_result.len());
+        }
+        let result = if rmp_serde::encode::write(&mut self.sender, &data).is_err() {
             Err(anyhow!("failed to send message to client"))
         } else {
             // TODO: unwrapping here can cause issues when the server disconnects which we don't mind
@@ -374,55 +383,93 @@ where
 
     /// Receives an event, along with the current [`ErrorContext`], on this [`IpcReceiverWithContext`]'s socket.
     pub fn recv(&mut self) -> Option<(T, ErrorContext)> {
-        let mut buf = Vec::with_capacity(512);
-        let mut counter = 0;
+        let mut initial_buf_size: usize = 1024;
+        if let Ok((_, available_byte)) = self.receiver.left_bytes() {
+            initial_buf_size = initial_buf_size.max(available_byte);
+        }
+        log::info!("allocate initial read buffer {} bytes", initial_buf_size);
+        let mut buf = Vec::with_capacity(initial_buf_size);
+        log::info!("Reading from pipe");
         loop {
-            let remaining_buffer = buf.spare_capacity_mut();
-            for element in remaining_buffer.iter_mut() {
-                element.write(0);
-            }
-            let remaining_buffer: &mut [u8] = unsafe { std::mem::transmute(remaining_buffer) };
+            loop {
+                let remaining_buffer = buf.spare_capacity_mut();
+                for element in remaining_buffer.iter_mut() {
+                    element.write(0);
+                }
+                let remaining_buffer: &mut [u8] = unsafe { std::mem::transmute(remaining_buffer) };
 
-            log::info!("Reading from pipe");
-            let consumed = self.receiver.read(remaining_buffer).unwrap();
-            unsafe { buf.set_len(buf.len() + consumed) };
-            let input = &buf;
-            if consumed > 0 {
-                counter = 0;
+                match self.receiver.read(remaining_buffer) {
+                    Ok(consumed) => unsafe {
+                        buf.set_len(buf.len() + consumed);
+                        if let Ok((left_message_bytes, _)) = self.receiver.left_bytes() {
+                            if left_message_bytes == 0 {
+                                break;
+                            } else {
+                                log::debug!("Request {:?} More Bytes!", left_message_bytes);
+                                buf.reserve_exact(left_message_bytes);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        log::error!("Error in IpcReceiver.recv(): {:?}", e);
+                    },
+                }
             }
+            let input = &buf;
+            log::debug!("Read {:?} bytes", input.len());
             match rmp_serde::decode::from_slice(input) {
-                Ok(msg) => break Some(msg),
-                Err(e) => {
-                    match e {
-                        rmp_serde::decode::Error::LengthMismatch(expected) => {
-                            let expected = expected as usize;
-                            if expected > input.len() {
-                                // we need more bytes
-                                if expected > buf.capacity() {
-                                    buf.reserve_exact(expected - buf.len())
-                                }
-                                continue;
-                            } else if expected < input.len() {
-                                // we have more than one message
-                                todo!("Decode first message and figure out what to do with the remainder")
-                            }
-                        },
-                        rmp_serde::decode::Error::InvalidDataRead(io_error)
-                        | rmp_serde::decode::Error::InvalidMarkerRead(io_error)
-                            if io_error.kind() == std::io::ErrorKind::UnexpectedEof =>
-                        {
-                            counter += 1;
-                            if counter > 5 {
-                                return None;
-                            }
-                            log::warn!("Missing some content in {:x?}", input);
-                            buf.reserve(1);
-                            continue;
-                        },
-                        _e => {
+                Ok(msg) => return Some(msg),
+                Err(e) => match e {
+                    rmp_serde::decode::Error::LengthMismatch(expected) => {
+                        let expected = expected as i32;
+                        let input_len = input.len() as i32;
+                        log::error!("expected {:?} bytes, but we read {:?}", expected, input_len);
+                        if expected > input_len {
+                            buf.reserve((expected - input_len) as usize);
+                            log::debug!("Request {:?} More Bytes!", expected - input_len);
+                        } else {
+                            log::error!("We should read less data!");
                             return None;
-                        },
-                    }
+                        }
+                    },
+                    rmp_serde::decode::Error::InvalidDataRead(io_error)
+                    | rmp_serde::decode::Error::InvalidMarkerRead(io_error)
+                        if io_error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        log::debug!("try read more data since Unexpected EOF err");
+                        let mut found_new_message = false;
+                        for _ in 0..10 {
+                            sleep(Duration::from_millis(1));
+                            if let Ok((left_message, available_data)) = self.receiver.left_bytes() {
+                                if left_message > 0 {
+                                    log::debug!("Found new {} bytes message", left_message);
+                                    buf.reserve(left_message);
+                                    found_new_message = true;
+                                    break;
+                                }
+
+                                if available_data > 0 {
+                                    log::debug!(
+                                        "Found new {} bytes available data",
+                                        available_data
+                                    );
+                                    buf.reserve(available_data);
+                                    found_new_message = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if found_new_message {
+                            continue;
+                        }
+                        log::warn!("Missing some content in {:x?}", &buf);
+                        return None;
+                    },
+                    _ => {
+                        log::error!("Error: {:?}", e);
+                        log::warn!("Missing some content in {:x?}", &buf);
+                        return None;
+                    },
                 },
             }
         }
