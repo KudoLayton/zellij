@@ -167,6 +167,10 @@ pub struct ClientOsInputOutput {
     receive_instructions_from_server: Arc<Mutex<Option<IpcReceiverWithContext<ServerToClientMsg>>>>,
     reading_from_stdin: Arc<Mutex<Option<Vec<u8>>>>,
     session_name: Arc<Mutex<Option<String>>>,
+    #[cfg(windows)]
+    orig_input_mode: Arc<Mutex<Option<u32>>>,
+    #[cfg(windows)]
+    orig_output_mode: Arc<Mutex<Option<u32>>>,
 }
 
 /// The `ClientOsApi` trait represents an abstract interface to the features of an operating system that
@@ -184,6 +188,8 @@ pub trait ClientOsApi: Send + Sync {
     /// [cooked mode](https://en.wikipedia.org/wiki/Terminal_mode).
     #[cfg(unix)]
     fn unset_raw_mode(&self, fd: RawFd) -> Result<(), nix::Error>;
+    #[cfg(windows)]
+    fn unset_raw_mode(&self, handle: u32) -> Result<()>;
     /// Returns the writer that allows writing to standard output.
     fn get_stdout_writer(&self) -> Box<dyn io::Write>;
     fn get_stdin_reader(&self) -> Box<dyn io::Read>;
@@ -244,6 +250,27 @@ impl ClientOsApi for ClientOsInputOutput {
                 Ok(())
             },
         }
+    }
+    #[cfg(windows)]
+    fn unset_raw_mode(&self, handle: u32) -> Result<()> {
+        let fd = unsafe { GetStdHandle(handle) };
+        let orig = match handle {
+            windows_sys::Win32::System::Console::STD_INPUT_HANDLE => {
+                self.orig_input_mode.lock().unwrap().take()
+            },
+            windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE => {
+                self.orig_output_mode.lock().unwrap().take()
+            },
+            _ => None,
+        };
+
+        if let Some(mode) = orig {
+            unsafe {
+                SetConsoleMode(fd, mode);
+            }
+        }
+
+        Ok(())
     }
     fn box_clone(&self) -> Box<dyn ClientOsApi> {
         Box::new((*self).clone())
