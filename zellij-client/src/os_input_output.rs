@@ -232,6 +232,22 @@ impl ClientOsApi for ClientOsInputOutput {
         let mut consolemode = 0 as u32;
         let fd = unsafe { GetStdHandle(handle) };
         unsafe { GetConsoleMode(fd, &mut consolemode) };
+
+        match handle {
+            STD_INPUT_HANDLE => {
+                let mut slot = self.orig_input_mode.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(consolemode.clone());
+                }
+            },
+            STD_OUTPUT_HANDLE => {
+                let mut slot = self.orig_output_mode.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(consolemode.clone());
+                }
+            },
+        }
+
         consolemode = (consolemode & !disable_mode) | enable_mode;
         unsafe { SetConsoleMode(fd, consolemode) };
         unsafe { SetConsoleCP(65001) }; // Set Input CP to UTF8 (https://learn.microsoft.com/de-de/windows/win32/intl/code-page-identifiers)
@@ -256,15 +272,18 @@ impl ClientOsApi for ClientOsInputOutput {
         let fd = unsafe { GetStdHandle(handle) };
         let orig = match handle {
             windows_sys::Win32::System::Console::STD_INPUT_HANDLE => {
+                log::debug!("try unset stdin");
                 self.orig_input_mode.lock().unwrap().take()
             },
             windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE => {
+                log::debug!("try unset stdout");
                 self.orig_output_mode.lock().unwrap().take()
             },
             _ => None,
         };
 
         if let Some(mode) = orig {
+            log::debug!("unset mode");
             unsafe {
                 SetConsoleMode(fd, mode);
             }
@@ -545,6 +564,8 @@ pub fn get_client_os_input() -> Result<ClientOsInputOutput, ()> {
         receive_instructions_from_server: Arc::new(Mutex::new(None)),
         reading_from_stdin: Arc::new(Mutex::new(None)),
         session_name: Arc::new(Mutex::new(None)),
+        orig_input_mode: Arc::new(Mutex::new(None)),
+        orig_output_mode: Arc::new(Mutex::new(None)),
     })
 }
 
@@ -568,6 +589,8 @@ pub fn get_cli_client_os_input() -> Result<ClientOsInputOutput, ()> {
         receive_instructions_from_server: Arc::new(Mutex::new(None)),
         reading_from_stdin: Arc::new(Mutex::new(None)),
         session_name: Arc::new(Mutex::new(None)),
+        orig_input_mode: Arc::new(Mutex::new(None)),
+        orig_output_mode: Arc::new(Mutex::new(None)),
     })
 }
 
