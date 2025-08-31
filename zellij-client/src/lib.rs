@@ -24,7 +24,8 @@ use crate::{
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{
     DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE,
 };
 #[cfg(unix)]
 use zellij_utils::consts::set_permissions;
@@ -540,6 +541,11 @@ pub fn start_client(
         );
 
         os_input.disable_mouse().non_fatal();
+        #[cfg(windows)]
+        {
+            let _ = os_input.unset_raw_mode(STD_INPUT_HANDLE);
+            let _ = os_input.unset_raw_mode(STD_OUTPUT_HANDLE);
+        }
         info!("{}", exit_msg);
         #[cfg(unix)]
         os_input.unset_raw_mode(0).unwrap();
