@@ -278,6 +278,26 @@ impl PipeStream {
         );
         Ok((left_bytes as usize, left_available_bytes as usize))
     }
+
+    pub fn is_ready_for_flush(
+        &self,
+        timeout_duration: std::time::Duration,
+        retry_duration: std::time::Duration,
+    ) -> bool {
+        debug_assert!(retry_duration < timeout_duration);
+        let start_time = std::time::Instant::now();
+        let mut elapsed = std::time::Duration::from_secs(0);
+        while elapsed < timeout_duration {
+            if let Ok((_, left_bytes)) = self.left_bytes() {
+                if left_bytes == 0 {
+                    return true;
+                }
+            }
+            std::thread::sleep(retry_duration);
+            elapsed = std::time::Instant::now() - start_time;
+        }
+        false
+    }
 }
 
 impl From<HANDLE> for PipeStream {
@@ -374,6 +394,17 @@ impl std::io::Write for PipeStream {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if !self.is_ready_for_flush(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_micros(10),
+        ) {
+            log::warn!("Timeout waiting for pipe to be ready for flush");
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Timeout waiting for pipe to be ready for flush",
+            ));
+        }
+        log::debug!("Flushing pipe");
         call_BOOL_with_last_error!(unsafe { FlushFileBuffers(self.0.as_raw_handle() as _) })
     }
 }
