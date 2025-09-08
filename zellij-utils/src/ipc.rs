@@ -381,6 +381,15 @@ where
         IpcSenderWithContext::new(socket)
     }
 
+    pub fn is_readbuffer_remained(&self) -> Result<bool, std::io::Error> {
+        match self.receiver.left_bytes() {
+            Ok((left_message_bytes, available_bytes)) => {
+                Ok(left_message_bytes > 0 || available_bytes > 0)
+            },
+            Err(e) => Err(e),
+        }
+    }
+
     /// Receives an event, along with the current [`ErrorContext`], on this [`IpcReceiverWithContext`]'s socket.
     pub fn recv(&mut self) -> Option<(T, ErrorContext)> {
         let mut initial_buf_size: usize = 1024;
