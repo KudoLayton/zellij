@@ -1000,12 +1000,32 @@ pub(crate) fn route_thread_main(
                 };
                 while let Some(instruction_to_retry) = retry_queue.pop_front() {
                     log::warn!("Server ready, retrying sending instruction.");
-                    let should_break = handle_instruction(instruction_to_retry, None)?;
+                    let mut should_break = handle_instruction(instruction_to_retry, None)?;
+                    #[cfg(windows)]
+                    {
+                        if let Ok(is_readbuffer_remained) = receiver.is_readbuffer_remained() {
+                            log::debug!(
+                                "is server router remains read buffer: {}",
+                                is_readbuffer_remained
+                            );
+                            should_break &= !is_readbuffer_remained;
+                        }
+                    }
                     if should_break {
                         break 'route_loop;
                     }
                 }
-                let should_break = handle_instruction(instruction, Some(&mut retry_queue))?;
+                let mut should_break = handle_instruction(instruction, Some(&mut retry_queue))?;
+                #[cfg(windows)]
+                {
+                    if let Ok(is_readbuffer_remained) = receiver.is_readbuffer_remained() {
+                        log::debug!(
+                            "is server router remains read buffer: {}",
+                            is_readbuffer_remained
+                        );
+                        should_break &= !is_readbuffer_remained;
+                    }
+                }
                 if should_break {
                     break 'route_loop;
                 }
