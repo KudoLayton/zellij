@@ -31,7 +31,13 @@ pub(crate) fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
                     .and_then(|d| d.elapsed().ok())
                     .unwrap_or_default();
                 let duration = Duration::from_secs(ctime.as_secs());
+                #[cfg(unix)]
                 if is_socket(&file).unwrap() && assert_socket(&file_name) {
+                    sessions.push((file_name, duration));
+                }
+
+                #[cfg(windows)]
+                if is_socket(&file).unwrap() {
                     sessions.push((file_name, duration));
                 }
                 // TODO windows
