@@ -450,7 +450,6 @@ impl ClientOsApi for ClientOsInputOutput {
             },
             Err(TryLockError::Poisoned(err)) => panic!("receiver has been poisoned"),
         };
-        log::info!("{:?} received from server", &result);
         result
     }
     fn handle_signals(&self, sigwinch_cb: Box<dyn Fn()>, quit_cb: Box<dyn Fn()>) {
