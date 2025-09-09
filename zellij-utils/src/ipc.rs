@@ -14,7 +14,7 @@ use crate::{
 };
 
 #[cfg(windows)]
-use winapi::shared::winerror::ERROR_MORE_DATA;
+use winapi::shared::winerror::{ERROR_BROKEN_PIPE, ERROR_MORE_DATA};
 
 #[cfg(unix)]
 use crate::shared::set_permissions;
@@ -381,12 +381,57 @@ where
         IpcSenderWithContext::new(socket)
     }
 
-    pub fn is_readbuffer_remained(&self) -> Result<bool, std::io::Error> {
+    pub fn is_usable(&self) -> Result<bool, std::io::Error> {
+        match self.receiver.left_bytes() {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if let Some(code) = e.raw_os_error() {
+                    match code as u32 {
+                        ERROR_BROKEN_PIPE => Ok(false),
+                        _ => Err(e),
+                    }
+                } else {
+                    Err(e)
+                }
+            },
+        }
+    }
+
+    pub fn is_read_buffer_remained(&self) -> Result<bool, std::io::Error> {
         match self.receiver.left_bytes() {
             Ok((left_message_bytes, available_bytes)) => {
                 Ok(left_message_bytes > 0 || available_bytes > 0)
             },
             Err(e) => Err(e),
+        }
+    }
+
+    pub fn clear_read_buffer(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            match self.is_usable() {
+                Ok(true) => {},
+                Ok(false) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+
+            if let Ok((_, left_bytes)) = self.receiver.left_bytes() {
+                let mut flush_buf: Vec<u8> = Vec::with_capacity(left_bytes);
+                let flush_buf_slice: &mut [u8] =
+                    unsafe { std::mem::transmute(flush_buf.spare_capacity_mut()) };
+                match self.receiver.read(flush_buf_slice) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        if let Some(code) = e.raw_os_error() {
+                            match code as u32 {
+                                ERROR_BROKEN_PIPE => return Ok(()),
+                                _ => return Err(e),
+                            }
+                        } else {
+                            return Err(e);
+                        }
+                    },
+                }
+            }
         }
     }
 
