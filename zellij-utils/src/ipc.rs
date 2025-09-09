@@ -441,7 +441,6 @@ where
         if let Ok((_, available_byte)) = self.receiver.left_bytes() {
             initial_buf_size = initial_buf_size.max(available_byte);
         }
-        log::info!("allocate initial read buffer {} bytes", initial_buf_size);
         let mut buf = Vec::with_capacity(initial_buf_size);
         log::info!("Reading from pipe");
         loop {
