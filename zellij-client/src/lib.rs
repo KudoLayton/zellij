@@ -22,11 +22,15 @@ use crate::{
     os_input_output::ClientOsApi, stdin_handler::stdin_loop,
 };
 #[cfg(windows)]
-use windows_sys::Win32::System::Console::{
-    DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE,
+use windows_sys::Win32::System::{
+    Console::{
+        DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE,
+    },
+    Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS},
 };
+
 #[cfg(unix)]
 use zellij_utils::consts::set_permissions;
 use zellij_utils::pane_size::Size;
@@ -130,7 +134,10 @@ fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let _status = cmd.spawn()?;
+        use std::os::windows::process::CommandExt;
+        let _status = cmd
+            .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+            .spawn()?;
         Ok(())
     }
 }
