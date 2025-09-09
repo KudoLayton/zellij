@@ -300,6 +300,15 @@ impl PipeStream {
     }
 }
 
+impl Drop for PipeStream {
+    fn drop(&mut self) {
+        log::debug!("Dropping PipeStream");
+        unsafe {
+            CloseHandle(self.0.as_raw_handle());
+        }
+    }
+}
+
 impl From<HANDLE> for PipeStream {
     fn from(value: HANDLE) -> Self {
         let handle = unsafe { OwnedHandle::from_raw_handle(value as _) };
