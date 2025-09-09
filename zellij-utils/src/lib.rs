@@ -42,7 +42,7 @@ pub fn is_socket(file: &std::fs::DirEntry) -> std::io::Result<bool> {
     use std::ffi::{OsStr, OsString};
     fn convert_path(pipe_name: &OsStr, hostname: Option<&OsStr>) -> Vec<u16> {
         static PREFIX_LITERAL: &str = r"\\";
-        static PIPEFS_LITERAL: &str = r"\pipe\";
+        static PIPEFS_LITERAL: &str = r"\pipe\zellij\";
 
         let hostname = hostname.unwrap_or_else(|| OsStr::new("."));
 
@@ -67,7 +67,7 @@ pub fn is_socket(file: &std::fs::DirEntry) -> std::io::Result<bool> {
         winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ},
     };
 
-    let path = convert_path(file.path().as_os_str(), None);
+    let path = convert_path(file.path().file_name().unwrap(), None);
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),

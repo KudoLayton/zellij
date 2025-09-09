@@ -49,11 +49,11 @@ fn iter_sessions() -> Result<Box<dyn Iterator<Item = DirEntry>>, io::Error> {
 
         let path = PathBuf::from("\\\\.\\pipe\\");
         match fs::read_dir(path) {
-            Ok(pipes) => Ok(Box::new(
-                pipes
-                    .map(|file| file.unwrap())
-                    .filter(|file| file.path().starts_with(&*ZELLIJ_SOCK_DIR)),
-            )),
+            Ok(pipes) => {
+                Ok(Box::new(pipes.map(|file| file.unwrap()).filter(|file| {
+                    file.path().starts_with("\\\\.\\pipe\\zellij")
+                })))
+            },
             Err(err) if io::ErrorKind::NotFound != err.kind() => Err(err),
             Err(_) => Ok(Box::new(empty())),
         }
