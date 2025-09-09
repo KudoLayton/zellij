@@ -445,7 +445,7 @@ impl ClientOsApi for ClientOsInputOutput {
                 .expect("Receiver should be initialized by now")
                 .recv(),
             Err(TryLockError::WouldBlock) => {
-                thread::sleep(std::time::Duration::from_secs_f32(0.1));
+                thread::sleep(std::time::Duration::from_micros(50));
                 None
             },
             Err(TryLockError::Poisoned(err)) => panic!("receiver has been poisoned"),
