@@ -831,6 +831,10 @@ pub(crate) fn route_thread_main(
     let mut retry_queue = VecDeque::new();
     let err_context = || format!("failed to handle instruction for client {client_id}");
     'route_loop: loop {
+        match receiver.is_usable() {
+            Ok(true) => {},
+            _ => break 'route_loop,
+        }
         match receiver.recv() {
             Some((instruction, err_ctx)) => {
                 err_ctx.update_thread_ctx();
@@ -1000,33 +1004,28 @@ pub(crate) fn route_thread_main(
                 };
                 while let Some(instruction_to_retry) = retry_queue.pop_front() {
                     log::warn!("Server ready, retrying sending instruction.");
-                    let mut should_break = handle_instruction(instruction_to_retry, None)?;
-                    #[cfg(windows)]
-                    {
-                        if let Ok(is_readbuffer_remained) = receiver.is_readbuffer_remained() {
-                            log::debug!(
-                                "is server router remains read buffer: {}",
-                                is_readbuffer_remained
-                            );
-                            should_break &= !is_readbuffer_remained;
-                        }
-                    }
+                    let should_break = handle_instruction(instruction_to_retry, None)?;
                     if should_break {
+                        #[cfg(windows)]
+                        {
+                            match receiver.clear_read_buffer() {
+                                Ok(()) => {},
+                                Err(e) => log::error!("Error ocurred while flushing remaining read buffer on server router: {}", e)
+                            }
+                        }
                         break 'route_loop;
                     }
                 }
+
                 let mut should_break = handle_instruction(instruction, Some(&mut retry_queue))?;
-                #[cfg(windows)]
-                {
-                    if let Ok(is_readbuffer_remained) = receiver.is_readbuffer_remained() {
-                        log::debug!(
-                            "is server router remains read buffer: {}",
-                            is_readbuffer_remained
-                        );
-                        should_break &= !is_readbuffer_remained;
-                    }
-                }
                 if should_break {
+                    #[cfg(windows)]
+                    {
+                        match receiver.clear_read_buffer() {
+                            Ok(()) => {},
+                            Err(e) => log::error!("Error ocurred while flushing remaining read buffer on server router: {}", e)
+                        }
+                    }
                     break 'route_loop;
                 }
             },
