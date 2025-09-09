@@ -493,7 +493,6 @@ where
                         log::debug!("try read more data since Unexpected EOF err");
                         let mut found_new_message = false;
                         for _ in 0..10 {
-                            sleep(Duration::from_micros(50));
                             if let Ok((left_message, available_data)) = self.receiver.left_bytes() {
                                 if left_message > 0 {
                                     log::debug!("Found new {} bytes message", left_message);
@@ -512,6 +511,7 @@ where
                                     break;
                                 }
                             }
+                            sleep(Duration::from_micros(10));
                         }
                         if found_new_message {
                             continue;
