@@ -59,38 +59,16 @@ pub fn is_socket(file: &std::fs::DirEntry) -> std::io::Result<bool> {
         path
     }
 
-    use std::{os::windows::ffi::OsStrExt, ptr};
-    use winapi::um::{
-        fileapi::{CreateFileW, GetFileType, OPEN_EXISTING},
-        handleapi::INVALID_HANDLE_VALUE,
-        winbase::FILE_TYPE_PIPE,
-        winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ},
-    };
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::namedpipeapi::WaitNamedPipeW;
 
     let path = convert_path(file.path().file_name().unwrap(), None);
-    let handle = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ptr::null_mut(),
-            OPEN_EXISTING,
-            0,
-            ptr::null_mut(),
-        )
-    };
-
-    if handle == INVALID_HANDLE_VALUE {
+    let check_result = unsafe { WaitNamedPipeW(path.as_ptr(), 1) };
+    if check_result == 0 {
         return Err(std::io::Error::last_os_error());
     }
 
-    let file_type = unsafe { GetFileType(handle) };
-    if file_type == 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(error);
-    }
-
-    Ok(file_type == FILE_TYPE_PIPE)
+    Ok(true)
 }
 
 #[cfg(unix)]
