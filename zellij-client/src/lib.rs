@@ -21,15 +21,27 @@ use crate::{
     command_is_executing::CommandIsExecuting, input_handler::input_loop,
     os_input_output::ClientOsApi, stdin_handler::stdin_loop,
 };
+#[cfg(windows)]
+use windows_sys::Win32::System::{
+    Console::{
+        DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE,
+    },
+    Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS},
+};
+
+#[cfg(unix)]
+use zellij_utils::consts::set_permissions;
+use zellij_utils::pane_size::Size;
 use zellij_utils::{
     channels::{self, ChannelWithContext, SenderWithContext},
-    consts::{set_permissions, ZELLIJ_SOCK_DIR},
+    consts::ZELLIJ_SOCK_DIR,
     data::{ClientId, ConnectToSession, InputMode, Style},
     envs,
     errors::{ClientContext, ContextType, ErrorInstruction},
     input::{config::Config, options::Options},
     ipc::{ClientAttributes, ClientToServerMsg, ExitReason, ServerToClientMsg},
-    pane_size::Size,
     termwiz::input::InputEvent,
 };
 use zellij_utils::{cli::CliArgs, input::layout::Layout};
@@ -118,17 +130,28 @@ fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
     if debug {
         cmd.arg("--debug");
     }
-    let status = cmd.status()?;
+    #[cfg(unix)]
+    {
+        let status = cmd.status()?;
 
-    if status.success() {
+        if status.success() {
+            Ok(())
+        } else {
+            let msg = "Process returned non-zero exit code";
+            let err_msg = match status.code() {
+                Some(c) => format!("{}: {}", msg, c),
+                None => msg.to_string(),
+            };
+            Err(io::Error::new(io::ErrorKind::Other, err_msg))
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _status = cmd
+            .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+            .spawn()?;
         Ok(())
-    } else {
-        let msg = "Process returned non-zero exit code";
-        let err_msg = match status.code() {
-            Some(c) => format!("{}: {}", msg, c),
-            None => msg.to_string(),
-        };
-        Err(io::Error::new(io::ErrorKind::Other, err_msg))
     }
 }
 
@@ -181,6 +204,7 @@ pub fn start_client(
     let clear_client_terminal_attributes = "\u{1b}[?1l\u{1b}=\u{1b}[r\u{1b}[?1000l\u{1b}[?1002l\u{1b}[?1003l\u{1b}[?1005l\u{1b}[?1006l\u{1b}[?12l";
     let take_snapshot = "\u{1b}[?1049h";
     let bracketed_paste = "\u{1b}[?2004h";
+    #[cfg(unix)]
     os_input.unset_raw_mode(0).unwrap();
 
     if !is_a_reconnect {
@@ -203,7 +227,8 @@ pub fn start_client(
         .theme_config(&config_options)
         .unwrap_or_else(|| os_input.load_palette());
 
-    let full_screen_ws = os_input.get_terminal_size_using_fd(0);
+    let full_screen_ws = os_input.get_terminal_size(os_input_output::HandleType::Stdout);
+
     let client_attributes = ClientAttributes {
         size: full_screen_ws,
         style: Style {
@@ -214,9 +239,11 @@ pub fn start_client(
         keybinds: config.keybinds.clone(),
     };
 
+    // TODO: Windows compatibility: Change ipc pipe to something cross platform instead of file
     let create_ipc_pipe = || -> std::path::PathBuf {
         let mut sock_dir = ZELLIJ_SOCK_DIR.clone();
         std::fs::create_dir_all(&sock_dir).unwrap();
+        #[cfg(unix)]
         set_permissions(&sock_dir, 0o700).unwrap();
         sock_dir.push(envs::get_session_name().unwrap());
         sock_dir
@@ -263,7 +290,16 @@ pub fn start_client(
 
     let mut command_is_executing = CommandIsExecuting::new();
 
-    os_input.set_raw_mode(0);
+    os_input.set_raw_mode(
+        windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+        ENABLE_VIRTUAL_TERMINAL_INPUT,
+        ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT,
+    );
+    os_input.set_raw_mode(
+        windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        0,
+    ); // & DISABLE_NEWLINE_AUTO_RETURN);
     let _ = os_input
         .get_stdout_writer()
         .write(bracketed_paste.as_bytes())
@@ -284,9 +320,13 @@ pub fn start_client(
         let send_client_instructions = send_client_instructions.clone();
         let os_input = os_input.clone();
         Box::new(move |info| {
+            #[cfg(unix)]
             if let Ok(()) = os_input.unset_raw_mode(0) {
                 handle_panic(info, &send_client_instructions);
             }
+
+            #[cfg(windows)]
+            handle_panic(info, &send_client_instructions);
         })
     });
 
@@ -332,7 +372,7 @@ pub fn start_client(
                         let os_api = os_input.clone();
                         move || {
                             os_api.send_to_server(ClientToServerMsg::TerminalResize(
-                                os_api.get_terminal_size_using_fd(0),
+                                os_api.get_terminal_size(os_input_output::HandleType::Stdin),
                             ));
                         }
                     }),
@@ -386,6 +426,7 @@ pub fn start_client(
         .unwrap();
 
     let handle_error = |backtrace: String| {
+        #[cfg(unix)]
         os_input.unset_raw_mode(0).unwrap();
         let goto_start_of_last_line = format!("\u{1b}[{};{}H", full_screen_ws.rows, 1);
         let restore_snapshot = "\u{1b}[?1049l";
@@ -510,7 +551,7 @@ pub fn start_client(
             },
             ClientInstruction::QueryTerminalSize => {
                 os_input.send_to_server(ClientToServerMsg::TerminalResize(
-                    os_input.get_terminal_size_using_fd(0),
+                    os_input.get_terminal_size(os_input_output::HandleType::Stdout),
                 ));
             },
             _ => {},
@@ -530,7 +571,13 @@ pub fn start_client(
         );
 
         os_input.disable_mouse().non_fatal();
+        #[cfg(windows)]
+        {
+            let _ = os_input.unset_raw_mode(STD_INPUT_HANDLE);
+            let _ = os_input.unset_raw_mode(STD_OUTPUT_HANDLE);
+        }
         info!("{}", exit_msg);
+        #[cfg(unix)]
         os_input.unset_raw_mode(0).unwrap();
         let mut stdout = os_input.get_stdout_writer();
         let _ = stdout.write(goodbye_message.as_bytes()).unwrap();
@@ -576,6 +623,7 @@ pub fn start_server_detached(
     let create_ipc_pipe = || -> std::path::PathBuf {
         let mut sock_dir = ZELLIJ_SOCK_DIR.clone();
         std::fs::create_dir_all(&sock_dir).unwrap();
+        #[cfg(unix)]
         set_permissions(&sock_dir, 0o700).unwrap();
         sock_dir.push(envs::get_session_name().unwrap());
         sock_dir

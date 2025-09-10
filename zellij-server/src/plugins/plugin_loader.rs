@@ -349,7 +349,7 @@ impl<'a> PluginLoader<'a> {
         default_layout: Box<Layout>,
     ) -> Result<Self> {
         let plugin_own_data_dir = ZELLIJ_SESSION_CACHE_DIR
-            .join(Url::from(&plugin.location).to_string())
+            .join(Url::from(&plugin.location).to_string().replace(":", "_"))
             .join(format!("{}-{}", plugin_id, client_id));
         create_plugin_fs_entries(&plugin_own_data_dir)?;
         let plugin_path = plugin.path.clone();

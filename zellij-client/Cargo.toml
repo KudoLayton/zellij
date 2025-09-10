@@ -9,7 +9,7 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-mio = { version = "0.7.11", features = ['os-ext'] }
+mio = { version = "0.8.8", features = ['os-ext'] }
 serde = { version = "1.0", features = ["derive"] }
 url = { version = "2.2.2", features = ["serde"] }
 serde_yaml = "0.8"
@@ -17,8 +17,16 @@ serde_json = "1.0"
 zellij-utils = { path = "../zellij-utils/", version = "0.40.0" }
 log = "0.4.17"
 
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.52.0"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+]
+
 [dev-dependencies]
 insta = "1.6.0"
 
 [features]
-unstable = [ ]
+unstable = []

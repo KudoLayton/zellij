@@ -22,10 +22,7 @@ use zellij_utils::data::{
     PermissionStatus, PermissionType, PluginPermission,
 };
 use zellij_utils::input::permission::PermissionCache;
-use zellij_utils::{
-    interprocess::local_socket::LocalSocketStream,
-    ipc::{ClientToServerMsg, IpcSenderWithContext},
-};
+use zellij_utils::ipc::{ClientToServerMsg, IpcSenderWithContext, IpcSocketStream};
 
 use crate::{panes::PaneId, screen::ScreenInstruction};
 
@@ -985,13 +982,12 @@ fn delete_dead_session(session_name: String) -> Result<()> {
 }
 
 fn delete_all_dead_sessions() -> Result<()> {
-    use std::os::unix::fs::FileTypeExt;
     let mut live_sessions = vec![];
     if let Ok(files) = std::fs::read_dir(&*ZELLIJ_SOCK_DIR) {
         files.for_each(|file| {
             if let Ok(file) = file {
                 if let Ok(file_name) = file.file_name().into_string() {
-                    if file.file_type().unwrap().is_socket() {
+                    if zellij_utils::is_socket(&file).expect("Failed to check for session") {
                         live_sessions.push(file_name);
                     }
                 }
@@ -1344,7 +1340,7 @@ fn disconnect_other_clients(env: &ForeignFunctionEnv) {
 fn kill_sessions(session_names: Vec<String>) {
     for session_name in session_names {
         let path = &*ZELLIJ_SOCK_DIR.join(&session_name);
-        match LocalSocketStream::connect(path) {
+        match IpcSocketStream::connect(path) {
             Ok(stream) => {
                 let _ = IpcSenderWithContext::new(stream).send(ClientToServerMsg::KillSession);
             },
