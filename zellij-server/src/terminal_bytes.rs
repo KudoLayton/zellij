@@ -4,10 +4,11 @@ use crate::{
     thread_bus::ThreadSenders,
 };
 use async_std::{future::timeout as async_timeout, task};
-use std::{
-    os::unix::io::RawFd,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
+
 use zellij_utils::{
     async_std,
     errors::{get_current_ctx, prelude::*, ContextType},
@@ -30,6 +31,7 @@ impl From<std::io::Result<usize>> for ReadResult {
 }
 
 pub(crate) struct TerminalBytes {
+    #[cfg(unix)]
     pid: RawFd,
     terminal_id: u32,
     senders: ThreadSenders,
@@ -44,18 +46,24 @@ pub(crate) struct TerminalBytes {
 
 impl TerminalBytes {
     pub fn new(
-        pid: RawFd,
+        #[cfg(unix)] pid: RawFd,
         senders: ThreadSenders,
         os_input: Box<dyn ServerOsApi>,
         debug: bool,
         terminal_id: u32,
     ) -> Self {
+        #[cfg(unix)]
+        let async_reader = os_input.async_file_reader(pid);
+        #[cfg(windows)]
+        let async_reader = os_input.async_file_reader(terminal_id);
+
         TerminalBytes {
+            #[cfg(unix)]
             pid,
             terminal_id,
             senders,
             debug,
-            async_reader: os_input.async_file_reader(pid),
+            async_reader,
             render_deadline: None,
             backed_up: false,
             minimum_render_send_time: None,
@@ -80,15 +88,14 @@ impl TerminalBytes {
         let mut err_ctx = get_current_ctx();
         err_ctx.add_call(ContextType::AsyncTask);
         let mut buf = [0u8; 65536];
+        log::info!("starting read");
         loop {
             match self.deadline_read(&mut buf).await {
-                // EOF
-                ReadResult::Ok(0) => break,
-                // Some error occured
-                ReadResult::Err(err) => {
-                    log::error!("{}", err);
+                ReadResult::Ok(0) => continue,
+                ReadResult::Err(_) => {
+                    log::info!("reached EoF");
                     break;
-                },
+                }, // EOF or error
                 ReadResult::Timeout => {
                     let time_to_send_render = self
                         .async_send_to_screen(ScreenInstruction::Render)
@@ -102,7 +109,10 @@ impl TerminalBytes {
                 ReadResult::Ok(n_bytes) => {
                     let bytes = &buf[..n_bytes];
                     if self.debug {
+                        #[cfg(unix)]
                         let _ = debug_to_file(bytes, self.pid);
+                        #[cfg(windows)]
+                        let _ = debug_to_file(bytes);
                     }
                     self.async_send_to_screen(ScreenInstruction::PtyBytes(
                         self.terminal_id,
