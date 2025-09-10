@@ -204,7 +204,6 @@ pub(crate) fn background_jobs_main(
                             }
                             task::sleep(std::time::Duration::from_millis(SESSION_READ_DURATION))
                                 .await;
-                            }
                         }
                     }
                 });
