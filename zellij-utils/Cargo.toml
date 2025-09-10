@@ -14,7 +14,7 @@ anyhow = { workspace = true }
 backtrace = { version = "0.3.55", default-features = false, features = ["std"] }
 bitflags = { version = "2.5.0", default-features = false }
 clap = { workspace = true }
-clap_complete = { version = "3.2.1", default-features = false }
+clap_complete = { version = "4.4.3", default-features = false }
 colored = { version = "2.0.0", default-features = false }
 colorsys = { version = "0.6.5", default-features = false, features = ["std"] }
 crossbeam = { version = "0.8.1", default-features = false, features = ["alloc", "std"] }
@@ -24,7 +24,6 @@ kdl = { version = "4.5.0", default-features = false, features = ["span"] }
 lazy_static = { workspace = true }
 log = { workspace = true }
 miette = { workspace = true }
-nix = { workspace = true }
 percent-encoding = { version = "2.1.0", default-features = false, features = ["std"] }
 prost = { workspace = true }
 rmp-serde = { workspace = true }
@@ -56,8 +55,15 @@ rusqlite = { version = "0.30", default-features = false, features = ["bundled"],
 notify = { workspace = true }
 tokio = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.9", features = ["winbase", "ioapiset"] }
+
+[target.'cfg(not(windows))'.dependencies]
+nix = { workspace = true }
+libc = { version = "0.2", default-features = false, features = ["std"] }
+
 [dev-dependencies]
-insta = { version = "1.6.0", features = ["backtrace"] }
+insta = { version = "1.6.0" }
 expect-test = "1.4.1"
 
 [build-dependencies]
@@ -71,5 +77,5 @@ prost-build = "0.11.9"
 disable_automatic_asset_installation = []
 unstable = []
 plugins_from_target = []
-web_server_capability = ["dep:rusqlite"]
+# web_server_capability = ["dep:rusqlite"]
 vendored_curl = ["isahc/static-curl", "dep:openssl-sys", "dep:curl-sys"]

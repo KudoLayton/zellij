@@ -5,6 +5,7 @@ use std::{fs::File, io::prelude::*, path::PathBuf, process, time::Duration};
 #[cfg(feature = "web_server_capability")]
 use isahc::{config::RedirectPolicy, prelude::*, HttpClient, Request};
 
+#[cfg(unix)]
 use nix;
 use zellij_client::{
     old_config_converter::{
@@ -141,6 +142,7 @@ pub(crate) fn delete_session(target_session: &Option<String>, force: bool) {
     }
 }
 
+#[cfg(unix)]
 fn get_os_input<OsInputOutput>(
     fn_get_os_input: fn() -> Result<OsInputOutput, nix::Error>,
 ) -> OsInputOutput {
@@ -148,6 +150,19 @@ fn get_os_input<OsInputOutput>(
         Ok(os_input) => os_input,
         Err(e) => {
             eprintln!("failed to open terminal:\n{}", e);
+            process::exit(1);
+        },
+    }
+}
+
+#[cfg(windows)]
+fn get_os_input<OsInputOutput>(
+    fn_get_os_input: fn() -> Result<OsInputOutput, ()>,
+) -> OsInputOutput {
+    match fn_get_os_input() {
+        Ok(os_input) => os_input,
+        Err(e) => {
+            eprintln!("failed to open terminal:\n{:?}", e);
             process::exit(1);
         },
     }
