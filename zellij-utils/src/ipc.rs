@@ -1,4 +1,7 @@
 //! IPC stuff for starting to split things into a client and server model.
+
+#[cfg(windows)]
+use crate::windows_utils::named_pipe::{Pipe, PipeStream};
 use crate::{
     cli::CliArgs,
     data::{ClientId, ConnectToSession, InputMode, Style},
@@ -7,16 +10,31 @@ use crate::{
     input::{actions::Action, layout::Layout, options::Options, plugins::PluginAliases},
     pane_size::{Size, SizeInPixels},
 };
-use interprocess::local_socket::LocalSocketStream;
-use log::warn;
+
+#[cfg(windows)]
+use winapi::shared::winerror::{ERROR_BROKEN_PIPE, ERROR_MORE_DATA};
+
+#[cfg(unix)]
+use crate::shared::set_permissions;
+
+#[cfg(unix)]
+use interprocess::local_socket::{LocalSocketListener, LocalSocketStream};
+
+#[cfg(unix)]
 use nix::unistd::dup;
+
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::{Display, Error, Formatter},
-    io::{self, Write},
+    io::{self, Read, Write},
     marker::PhantomData,
-    os::unix::io::{AsRawFd, FromRawFd},
+    path::Path,
+    thread::sleep,
+    time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 
 type SessionId = u64;
 
@@ -91,6 +109,38 @@ pub enum ClientToServerMsg {
     ListClients,
 }
 
+impl Display for ClientToServerMsg {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientToServerMsg::DetachSession(_) => write!(f, "ClientToServerMsg::DetachSession"),
+            ClientToServerMsg::TerminalPixelDimensions(_) => {
+                write!(f, "ClientToServerMsg::TerminalPixelDimensions")
+            },
+            ClientToServerMsg::BackgroundColor(_) => {
+                write!(f, "ClientToServerMsg::BackgroundColor")
+            },
+            ClientToServerMsg::ForegroundColor(_) => {
+                write!(f, "ClientToServerMsg::ForegroundColor")
+            },
+            ClientToServerMsg::ColorRegisters(_) => write!(f, "ClientToServerMsg::ColorRegisters"),
+            ClientToServerMsg::TerminalResize(_) => write!(f, "ClientToServerMsg::TerminalResize"),
+            ClientToServerMsg::NewClient(_, _, _, _, _) => {
+                write!(f, "ClientToServerMsg::NewClient")
+            },
+            ClientToServerMsg::AttachClient(_, _, _, _) => {
+                write!(f, "ClientToServerMsg::AttachClient")
+            },
+            ClientToServerMsg::Action(action, _, _) => {
+                write!(f, "ClientToServerMsg::Action({:?})", action)
+            },
+            ClientToServerMsg::ClientExited => write!(f, "ClientToServerMsg::ClientExited"),
+            ClientToServerMsg::KillSession => write!(f, "ClientToServerMsg::KillSession"),
+            ClientToServerMsg::ConnStatus => write!(f, "ClientToServerMsg::ConnStatus"),
+            ClientToServerMsg::ListClients => write!(f, "ClientToServerMsg::ListClients"),
+        }
+    }
+}
+
 // Types of messages sent from the server to the client
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ServerToClientMsg {
@@ -106,6 +156,31 @@ pub enum ServerToClientMsg {
     UnblockCliPipeInput(String),   // String -> pipe name
     CliPipeOutput(String, String), // String -> pipe name, String -> Output
     QueryTerminalSize,
+}
+
+impl Display for ServerToClientMsg {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerToClientMsg::Render(..) => write!(f, "ServerToClientMsg::Render"),
+            ServerToClientMsg::UnblockInputThread => {
+                write!(f, "ServerToClientMsg::UnblockInputThread")
+            },
+            ServerToClientMsg::Exit(..) => write!(f, "ServerToClientMsg::Exit"),
+            ServerToClientMsg::SwitchToMode(..) => write!(f, "ServerToClientMsg::SwitchToMode"),
+            ServerToClientMsg::Connected => write!(f, "ServerToClientMsg::Connected"),
+            ServerToClientMsg::ActiveClients(..) => write!(f, "ServerToClientMsg::ActiveClients"),
+            ServerToClientMsg::Log(..) => write!(f, "ServerToClientMsg::Log"),
+            ServerToClientMsg::LogError(..) => write!(f, "ServerToClientMsg::LogError"),
+            ServerToClientMsg::SwitchSession(..) => write!(f, "ServerToClientMsg::SwitchSession"),
+            ServerToClientMsg::UnblockCliPipeInput(..) => {
+                write!(f, "ServerToClientMsg::UnblockCliPipeInput")
+            }, // String -> pipe name
+            ServerToClientMsg::CliPipeOutput(..) => write!(f, "ServerToClientMsg::CliPipeOutput"), // String -> pipe name, String -> Output
+            ServerToClientMsg::QueryTerminalSize => {
+                write!(f, "ServerToClientMsg::QueryTerminalSize")
+            }, // String -> pipe name, String -> Output
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -160,12 +235,18 @@ There are a few things you can try now:
     }
 }
 
+#[cfg(windows)]
+pub type IpcSocketStream = PipeStream;
+#[cfg(unix)]
+pub type IpcSocketStream = LocalSocketStream;
+
 /// Sends messages on a stream socket, along with an [`ErrorContext`].
 pub struct IpcSenderWithContext<T: Serialize> {
-    sender: io::BufWriter<LocalSocketStream>,
+    sender: io::BufWriter<IpcSocketStream>,
     _phantom: PhantomData<T>,
 }
 
+#[cfg(unix)]
 impl<T: Serialize> IpcSenderWithContext<T> {
     /// Returns a sender to the given [LocalSocketStream](interprocess::local_socket::LocalSocketStream).
     pub fn new(sender: LocalSocketStream) -> Self {
@@ -200,12 +281,60 @@ impl<T: Serialize> IpcSenderWithContext<T> {
     }
 }
 
+#[cfg(windows)]
+impl<T: Serialize> IpcSenderWithContext<T> {
+    /// Returns a sender to the given [PipeStream](zellij_utils::windows_utils::named_pipe::PipeStream).
+    pub fn new(sender: PipeStream) -> Self {
+        Self {
+            sender: io::BufWriter::new(sender),
+            _phantom: PhantomData,
+        }
+    }
+
+    ///Returns an [`IpcReceiverWithContext`] with the same socket as this sender.
+    pub fn get_receiver<F>(&self) -> IpcReceiverWithContext<F>
+    where
+        F: for<'de> Deserialize<'de> + Serialize,
+    {
+        let socket = self
+            .sender
+            .get_ref()
+            .try_clone()
+            .expect("Failed to duplicate pipe to obtain receiver");
+        IpcReceiverWithContext::new(socket)
+    }
+
+    /// Sends an event, along with the current [`ErrorContext`], on this [`IpcSenderWithContext`]'s socket.
+    pub fn send(&mut self, msg: T) -> Result<()> {
+        log::debug!("Sending message");
+        let err_ctx = get_current_ctx();
+        let data = (msg, err_ctx);
+        if let Ok(test_result) = rmp_serde::encode::to_vec(&data) {
+            log::debug!("Writing {} bytes to pipe", test_result.len());
+        }
+        let result = if rmp_serde::encode::write(&mut self.sender, &data).is_err() {
+            Err(anyhow!("failed to send message to client"))
+        } else {
+            // TODO: unwrapping here can cause issues when the server disconnects which we don't mind
+            // do we need to handle errors here in other cases?
+            let _ = self.sender.flush();
+            Ok(())
+        };
+        log::debug!("Message sent with {:?}", &result);
+        result
+    }
+}
+
 /// Receives messages on a stream socket, along with an [`ErrorContext`].
 pub struct IpcReceiverWithContext<T> {
-    receiver: io::BufReader<LocalSocketStream>,
+    #[cfg(unix)]
+    receiver: io::BufReader<IpcSocketStream>,
+    #[cfg(windows)]
+    receiver: IpcSocketStream,
     _phantom: PhantomData<T>,
 }
 
+#[cfg(unix)]
 impl<T> IpcReceiverWithContext<T>
 where
     T: for<'de> Deserialize<'de> + Serialize,
@@ -236,4 +365,195 @@ where
         let socket = unsafe { LocalSocketStream::from_raw_fd(dup_sock) };
         IpcSenderWithContext::new(socket)
     }
+}
+
+#[cfg(windows)]
+impl<T> IpcReceiverWithContext<T>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    /// Returns a receiver to the given [PipeStream](zellij_utils::windows_utils::named_pipe::PipeStream).
+    pub fn new(receiver: PipeStream) -> Self {
+        Self {
+            receiver,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Returns an [`IpcSenderWithContext`] with the same socket as this receiver.
+    pub fn get_sender<F: Serialize>(&self) -> IpcSenderWithContext<F> {
+        let socket = self
+            .receiver
+            .try_clone()
+            .expect("Failed to duplicate pipe to obtain sender");
+        IpcSenderWithContext::new(socket)
+    }
+
+    pub fn is_usable(&self) -> Result<bool, std::io::Error> {
+        match self.receiver.left_bytes() {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if let Some(code) = e.raw_os_error() {
+                    match code as u32 {
+                        ERROR_BROKEN_PIPE => Ok(false),
+                        _ => Err(e),
+                    }
+                } else {
+                    Err(e)
+                }
+            },
+        }
+    }
+
+    pub fn is_read_buffer_remained(&self) -> Result<bool, std::io::Error> {
+        match self.receiver.left_bytes() {
+            Ok((left_message_bytes, available_bytes)) => {
+                Ok(left_message_bytes > 0 || available_bytes > 0)
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn clear_read_buffer(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            match self.is_usable() {
+                Ok(true) => {},
+                Ok(false) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+
+            if let Ok((_, left_bytes)) = self.receiver.left_bytes() {
+                let mut flush_buf: Vec<u8> = Vec::with_capacity(left_bytes);
+                let flush_buf_slice: &mut [u8] =
+                    unsafe { std::mem::transmute(flush_buf.spare_capacity_mut()) };
+                match self.receiver.read(flush_buf_slice) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        if let Some(code) = e.raw_os_error() {
+                            match code as u32 {
+                                ERROR_BROKEN_PIPE => return Ok(()),
+                                _ => return Err(e),
+                            }
+                        } else {
+                            return Err(e);
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    /// Receives an event, along with the current [`ErrorContext`], on this [`IpcReceiverWithContext`]'s socket.
+    pub fn recv(&mut self) -> Option<(T, ErrorContext)> {
+        let mut initial_buf_size: usize = 1024;
+        if let Ok((_, available_byte)) = self.receiver.left_bytes() {
+            initial_buf_size = initial_buf_size.max(available_byte);
+        }
+        let mut buf = Vec::with_capacity(initial_buf_size);
+        log::info!("Reading from pipe");
+        loop {
+            loop {
+                let remaining_buffer = buf.spare_capacity_mut();
+                for element in remaining_buffer.iter_mut() {
+                    element.write(0);
+                }
+                let remaining_buffer: &mut [u8] = unsafe { std::mem::transmute(remaining_buffer) };
+
+                match self.receiver.read(remaining_buffer) {
+                    Ok(consumed) => unsafe {
+                        buf.set_len(buf.len() + consumed);
+                        if let Ok((left_message_bytes, _)) = self.receiver.left_bytes() {
+                            if left_message_bytes == 0 {
+                                break;
+                            } else {
+                                log::debug!("Request {:?} More Bytes!", left_message_bytes);
+                                buf.reserve_exact(left_message_bytes);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        log::error!("Error in IpcReceiver.recv(): {:?}", e);
+                    },
+                }
+            }
+            let input = &buf;
+            log::debug!("Read {:?} bytes", input.len());
+            match rmp_serde::decode::from_slice(input) {
+                Ok(msg) => return Some(msg),
+                Err(e) => match e {
+                    rmp_serde::decode::Error::LengthMismatch(expected) => {
+                        let expected = expected as i32;
+                        let input_len = input.len() as i32;
+                        log::error!("expected {:?} bytes, but we read {:?}", expected, input_len);
+                        if expected > input_len {
+                            buf.reserve((expected - input_len) as usize);
+                            log::debug!("Request {:?} More Bytes!", expected - input_len);
+                        } else {
+                            log::error!("We should read less data!");
+                            return None;
+                        }
+                    },
+                    rmp_serde::decode::Error::InvalidDataRead(io_error)
+                    | rmp_serde::decode::Error::InvalidMarkerRead(io_error)
+                        if io_error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        log::debug!("try read more data since Unexpected EOF err");
+                        let mut found_new_message = false;
+                        for _ in 0..10 {
+                            if let Ok((left_message, available_data)) = self.receiver.left_bytes() {
+                                if left_message > 0 {
+                                    log::debug!("Found new {} bytes message", left_message);
+                                    buf.reserve(left_message);
+                                    found_new_message = true;
+                                    break;
+                                }
+
+                                if available_data > 0 {
+                                    log::debug!(
+                                        "Found new {} bytes available data",
+                                        available_data
+                                    );
+                                    buf.reserve(available_data);
+                                    found_new_message = true;
+                                    break;
+                                }
+                            }
+                            sleep(Duration::from_micros(10));
+                        }
+                        if found_new_message {
+                            continue;
+                        }
+                        log::warn!("Missing some content in {:x?}", &buf);
+                        return None;
+                    },
+                    _ => {
+                        log::error!("Error: {:?}", e);
+                        log::warn!("Missing some content in {:x?}", &buf);
+                        return None;
+                    },
+                },
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+pub fn bind_server(name: &Path) -> Result<LocalSocketListener> {
+    let socket_path = name;
+    drop(std::fs::remove_file(&socket_path));
+    let listener = LocalSocketListener::bind(&*socket_path)?;
+    // set the sticky bit to avoid the socket file being potentially cleaned up
+    // https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html states that for XDG_RUNTIME_DIR:
+    // "To ensure that your files are not removed, they should have their access time timestamp modified at least once every 6 hours of monotonic time or the 'sticky' bit should be set on the file. "
+    // It is not guaranteed that all platforms allow setting the sticky bit on sockets!
+    drop(set_permissions(&socket_path, 0o1700));
+
+    return Ok(listener);
+}
+
+#[cfg(windows)]
+pub fn bind_server(name: &Path) -> Result<Pipe> {
+    let pipe = Pipe::new(name);
+
+    Ok(pipe)
 }

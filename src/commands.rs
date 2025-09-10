@@ -27,9 +27,11 @@ use zellij_utils::{
         options::Options,
     },
     miette::{Report, Result},
-    nix,
     setup::{find_default_config_dir, get_layout_dir, Setup},
 };
+
+#[cfg(unix)]
+use zellij_utils::nix;
 
 pub(crate) use crate::sessions::list_sessions;
 
@@ -124,6 +126,7 @@ pub(crate) fn delete_session(target_session: &Option<String>, force: bool) {
     }
 }
 
+#[cfg(unix)]
 fn get_os_input<OsInputOutput>(
     fn_get_os_input: fn() -> Result<OsInputOutput, nix::Error>,
 ) -> OsInputOutput {
@@ -131,6 +134,19 @@ fn get_os_input<OsInputOutput>(
         Ok(os_input) => os_input,
         Err(e) => {
             eprintln!("failed to open terminal:\n{}", e);
+            process::exit(1);
+        },
+    }
+}
+
+#[cfg(windows)]
+fn get_os_input<OsInputOutput>(
+    fn_get_os_input: fn() -> Result<OsInputOutput, ()>,
+) -> OsInputOutput {
+    match fn_get_os_input() {
+        Ok(os_input) => os_input,
+        Err(e) => {
+            eprintln!("failed to open terminal:\n{:?}", e);
             process::exit(1);
         },
     }

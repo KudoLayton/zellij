@@ -100,15 +100,15 @@ pub enum Sessions {
     #[clap(visible_alias = "ls")]
     ListSessions {
         /// Do not add colors and formatting to the list (useful for parsing)
-        #[clap(short, long, value_parser, takes_value(false), default_value("false"))]
+        #[clap(short, long, value_parser, num_args(0), default_value("false"))]
         no_formatting: bool,
 
         /// Print just the session name
-        #[clap(short, long, value_parser, takes_value(false), default_value("false"))]
+        #[clap(short, long, value_parser, num_args(0), default_value("false"))]
         short: bool,
 
         /// List the sessions in reverse order (default is ascending order)
-        #[clap(short, long, value_parser, takes_value(false), default_value("false"))]
+        #[clap(short, long, value_parser, num_args(0), default_value("false"))]
         reverse: bool,
     },
     /// List existing plugin aliases
@@ -138,7 +138,7 @@ pub enum Sessions {
         options: Option<Box<SessionCommand>>,
 
         /// If resurrecting a dead session, immediately run all its commands on startup
-        #[clap(short, long, value_parser, takes_value(false), default_value("false"))]
+        #[clap(short, long, value_parser, num_args(0), default_value("false"))]
         force_run_commands: bool,
     },
 
@@ -157,7 +157,7 @@ pub enum Sessions {
         #[clap(value_parser)]
         target_session: Option<String>,
         /// Kill the session if it's running before deleting it
-        #[clap(short, long, value_parser, takes_value(false), default_value("false"))]
+        #[clap(short, long, value_parser, num_args(0), default_value("false"))]
         force: bool,
     },
 
@@ -176,7 +176,7 @@ pub enum Sessions {
         #[clap(short, long, value_parser)]
         yes: bool,
         /// Kill the sessions if they're running before deleting them
-        #[clap(short, long, value_parser, takes_value(false), default_value("false"))]
+        #[clap(short, long, value_parser, num_args(0), default_value("false"))]
         force: bool,
     },
 
@@ -200,7 +200,7 @@ pub enum Sessions {
         cwd: Option<PathBuf>,
 
         /// Open the new pane in floating mode
-        #[clap(short, long, value_parser, default_value("false"), takes_value(false))]
+        #[clap(short, long, value_parser, default_value("false"), num_args(0))]
         floating: bool,
 
         /// Open the new pane in place of the current pane, temporarily suspending it
@@ -209,7 +209,7 @@ pub enum Sessions {
             long,
             value_parser,
             default_value("false"),
-            takes_value(false),
+            num_args(0),
             conflicts_with("floating"),
             conflicts_with("direction")
         )]
@@ -220,11 +220,11 @@ pub enum Sessions {
         name: Option<String>,
 
         /// Close the pane immediately when its command exits
-        #[clap(short, long, value_parser, default_value("false"), takes_value(false))]
+        #[clap(short, long, value_parser, default_value("false"), num_args(0))]
         close_on_exit: bool,
 
         /// Start the command suspended, only running after you first presses ENTER
-        #[clap(short, long, value_parser, default_value("false"), takes_value(false))]
+        #[clap(short, long, value_parser, default_value("false"), num_args(0))]
         start_suspended: bool,
 
         /// The x coordinates if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
@@ -252,7 +252,7 @@ pub enum Sessions {
         configuration: Option<PluginUserConfiguration>,
 
         /// Open the new pane in floating mode
-        #[clap(short, long, value_parser, default_value("false"), takes_value(false))]
+        #[clap(short, long, value_parser, default_value("false"))]
         floating: bool,
 
         /// Open the new pane in place of the current pane, temporarily suspending it
@@ -261,13 +261,12 @@ pub enum Sessions {
             long,
             value_parser,
             default_value("false"),
-            takes_value(false),
             conflicts_with("floating")
         )]
         in_place: bool,
 
         /// Skip the memory and HD cache and force recompile of the plugin (good for development)
-        #[clap(short, long, value_parser, default_value("false"), takes_value(false))]
+        #[clap(short, long, value_parser, default_value("false"), num_args(0))]
         skip_plugin_cache: bool,
         /// The x coordinates if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
         #[clap(short, long, requires("floating"))]
@@ -301,14 +300,14 @@ pub enum Sessions {
             long,
             value_parser,
             default_value("false"),
-            takes_value(false),
+            num_args(0),
             conflicts_with("floating"),
             conflicts_with("direction")
         )]
         in_place: bool,
 
         /// Open the new pane in floating mode
-        #[clap(short, long, value_parser, default_value("false"), takes_value(false))]
+        #[clap(short, long, value_parser, default_value("false"), num_args(0))]
         floating: bool,
 
         /// Change the working directory of the editor
@@ -417,7 +416,7 @@ pub enum CliAction {
         path: PathBuf,
 
         /// Dump the pane with full scrollback
-        #[clap(short, long, value_parser, default_value("false"), takes_value(false))]
+        #[clap(short, long, value_parser, default_value("false"), num_args(0))]
         full: bool,
     },
     /// Dump current layout to stdout
@@ -464,7 +463,7 @@ pub enum CliAction {
         cwd: Option<PathBuf>,
 
         /// Open the new pane in floating mode
-        #[clap(short, long, value_parser, default_value("false"), takes_value(false))]
+        #[clap(short, long, value_parser, default_value("false"), num_args(0))]
         floating: bool,
 
         /// Open the new pane in place of the current pane, temporarily suspending it
@@ -473,7 +472,7 @@ pub enum CliAction {
             long,
             value_parser,
             default_value("false"),
-            takes_value(false),
+            num_args(0),
             conflicts_with("floating"),
             conflicts_with("direction")
         )]
@@ -489,7 +488,7 @@ pub enum CliAction {
             long,
             value_parser,
             default_value("false"),
-            takes_value(false),
+            num_args(0),
             requires("command")
         )]
         close_on_exit: bool,
@@ -499,7 +498,7 @@ pub enum CliAction {
             long,
             value_parser,
             default_value("false"),
-            takes_value(false),
+            num_args(0),
             requires("command")
         )]
         start_suspended: bool,
@@ -533,7 +532,7 @@ pub enum CliAction {
         line_number: Option<usize>,
 
         /// Open the new pane in floating mode
-        #[clap(short, long, value_parser, default_value("false"), takes_value(false))]
+        #[clap(short, long, value_parser, default_value("false"), num_args(0))]
         floating: bool,
 
         /// Open the new pane in place of the current pane, temporarily suspending it
@@ -542,7 +541,7 @@ pub enum CliAction {
             long,
             value_parser,
             default_value("false"),
-            takes_value(false),
+            num_args(0),
             conflicts_with("floating"),
             conflicts_with("direction")
         )]
@@ -702,7 +701,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
             short('l'),
             long,
             value_parser,
-            takes_value(false),
+            num_args(0),
             default_value("false"),
             display_order(5)
         )]
@@ -712,7 +711,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
             short('s'),
             long,
             value_parser,
-            takes_value(false),
+            num_args(0),
             default_value("false"),
             display_order(6)
         )]
