@@ -4,16 +4,18 @@ use crate::{
     thread_bus::ThreadSenders,
 };
 use async_std::task;
-use std::{
-    os::unix::io::RawFd,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
+
 use zellij_utils::{
     errors::{get_current_ctx, prelude::*, ContextType},
     logging::debug_to_file,
 };
 
 pub(crate) struct TerminalBytes {
+    #[cfg(unix)]
     pid: RawFd,
     terminal_id: u32,
     senders: ThreadSenders,
@@ -23,18 +25,25 @@ pub(crate) struct TerminalBytes {
 
 impl TerminalBytes {
     pub fn new(
-        pid: RawFd,
+        #[cfg(unix)] pid: RawFd,
         senders: ThreadSenders,
         os_input: Box<dyn ServerOsApi>,
         debug: bool,
         terminal_id: u32,
     ) -> Self {
+        #[cfg(unix)]
+        let async_reader = os_input.async_file_reader(pid);
+        #[cfg(windows)]
+        let async_reader = os_input.async_file_reader(terminal_id);
+
         TerminalBytes {
+            #[cfg(unix)]
             pid,
+            #[cfg(windows)]
             terminal_id,
             senders,
             debug,
-            async_reader: os_input.async_file_reader(pid),
+            async_reader,
         }
     }
     pub async fn listen(&mut self) -> Result<()> {
@@ -54,6 +63,7 @@ impl TerminalBytes {
         let mut err_ctx = get_current_ctx();
         err_ctx.add_call(ContextType::AsyncTask);
         let mut buf = [0u8; 65536];
+        log::info!("starting read");
         loop {
             match self.async_reader.read(&mut buf).await {
                 Ok(0) => break, // EOF
@@ -64,7 +74,10 @@ impl TerminalBytes {
                 Ok(n_bytes) => {
                     let bytes = &buf[..n_bytes];
                     if self.debug {
+                        #[cfg(unix)]
                         let _ = debug_to_file(bytes, self.pid);
+                        #[cfg(windows)]
+                        let _ = debug_to_file(bytes);
                     }
                     self.async_send_to_screen(ScreenInstruction::PtyBytes(
                         self.terminal_id,

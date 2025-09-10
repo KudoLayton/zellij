@@ -7,6 +7,7 @@ use zellij_utils::data::{Event, HttpVerb, SessionInfo};
 use zellij_utils::errors::{prelude::*, BackgroundJobContext, ContextType};
 use zellij_utils::input::layout::RunPlugin;
 
+use zellij_utils::is_socket;
 use isahc::prelude::*;
 use isahc::AsyncReadResponseExt;
 use isahc::{config::RedirectPolicy, HttpClient, Request};
@@ -14,6 +15,7 @@ use isahc::{config::RedirectPolicy, HttpClient, Request};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::sync::{
@@ -479,22 +481,22 @@ fn write_session_state_to_disk(
 }
 
 fn read_other_live_session_states(current_session_name: &str) -> BTreeMap<String, SessionInfo> {
-    let mut other_session_names = vec![];
-    let mut session_infos_on_machine = BTreeMap::new();
+    let mut other_session_names: Vec<String> = vec![];
+    let session_infos_on_machine = BTreeMap::new();
     // we do this so that the session infos will be actual and we're
     // reasonably sure their session is running
     if let Ok(files) = fs::read_dir(&*ZELLIJ_SOCK_DIR) {
         files.for_each(|file| {
             if let Ok(file) = file {
                 if let Ok(file_name) = file.file_name().into_string() {
-                    if file.file_type().unwrap().is_socket() {
+                    if is_socket(&file).expect("Could not check for pipe") {
                         other_session_names.push(file_name);
                     }
                 }
             }
         });
     }
-
+    #[cfg(unix)]
     for session_name in other_session_names {
         let session_cache_file_name = session_info_cache_file_name(&session_name);
         if let Ok(raw_session_info) = fs::read_to_string(&session_cache_file_name) {

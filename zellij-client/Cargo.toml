@@ -12,10 +12,8 @@ license = "MIT"
 anyhow = { workspace = true }
 interprocess = { workspace = true }
 lazy_static = { workspace = true }
-libc = { workspace = true }
 log = { workspace = true }
-mio = { version = "0.7.11", default-features = false, features = ['os-ext'] }
-nix = { workspace = true }
+mio = { version = "0.8.8", default-features = false, features = ['os-ext'] }
 notify-debouncer-full = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
@@ -27,8 +25,20 @@ url = { workspace = true }
 uuid = { workspace = true }
 zellij-utils = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.52.0"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+]
+
 [dev-dependencies]
 insta = "1.6.0"
 
 [features]
-unstable = [ ]
+unstable = []

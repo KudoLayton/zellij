@@ -10,7 +10,9 @@ use crate::sessions::{
     SessionNameMatch,
 };
 use miette::{Report, Result};
-use nix;
+#[cfg(unix)]
+use zellij_utils::nix;
+
 use zellij_client::{
     old_config_converter::{
         config_yaml_to_config_kdl, convert_old_yaml_files, layout_yaml_to_layout_kdl,
@@ -125,6 +127,7 @@ pub(crate) fn delete_session(target_session: &Option<String>, force: bool) {
     }
 }
 
+#[cfg(unix)]
 fn get_os_input<OsInputOutput>(
     fn_get_os_input: fn() -> Result<OsInputOutput, nix::Error>,
 ) -> OsInputOutput {
@@ -132,6 +135,19 @@ fn get_os_input<OsInputOutput>(
         Ok(os_input) => os_input,
         Err(e) => {
             eprintln!("failed to open terminal:\n{}", e);
+            process::exit(1);
+        },
+    }
+}
+
+#[cfg(windows)]
+fn get_os_input<OsInputOutput>(
+    fn_get_os_input: fn() -> Result<OsInputOutput, ()>,
+) -> OsInputOutput {
+    match fn_get_os_input() {
+        Ok(os_input) => os_input,
+        Err(e) => {
+            eprintln!("failed to open terminal:\n{:?}", e);
             process::exit(1);
         },
     }

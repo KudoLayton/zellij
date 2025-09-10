@@ -3,6 +3,7 @@ use crate::{
     os_input_output::ClientOsApi, stdin_ansi_parser::AnsiStdinInstruction, ClientId,
     ClientInstruction, CommandIsExecuting, InputInstruction,
 };
+
 use termwiz::input::{InputEvent, Modifiers, MouseButtons, MouseEvent as TermwizMouseEvent};
 use zellij_utils::{
     channels::{Receiver, SenderWithContext, OPENCALLS},

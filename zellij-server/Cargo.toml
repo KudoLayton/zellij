@@ -20,8 +20,6 @@ byteorder = { version = "1.4.3", default-features = false, features = ["std"] }
 bytes = { version = "1.6.0", default-features = false, features = ["std"] }
 cassowary = { version = "0.3.0", default-features = false }
 chrono = { version = "0.4.19", default-features = false, features = ["std", "clock"] }
-close_fds = { version = "0.3.2", default-features = false }
-daemonize = { version = "0.5", default-features = false }
 highway = { version = "0.6.4", default-features = false, features = ["std"] }
 interprocess = { workspace = true }
 isahc = { workspace = true }
@@ -38,7 +36,7 @@ serde_json = { workspace = true }
 signal-hook = { workspace = true }
 sixel-image = { version = "0.1.0", default-features = false }
 sixel-tokenizer = { version = "0.1.0", default-features = false }
-sysinfo = { version = "0.22.5", default-features = false }
+sysinfo = { version = "0.29.10", default-features = false }
 tempfile = { workspace = true }
 typetag = { version = "0.1.7", default-features = false }
 unicode-width = { workspace = true }
@@ -61,6 +59,15 @@ features = [
   'runtime',
   'std',
 ]
+
+[target.'cfg(unix)'.dependencies]
+close_fds = { version = "0.3.2", default-features = false }
+daemonize = { version = "0.5", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winpty-rs = "0.3.13"
+windows = { version = "0.52.0", features = ["Win32_System_Console"] }
+
 
 [dev-dependencies]
 insta = "1.6.0"
