@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 [package]
 name = "zellij"
 version = "0.43.0"
@@ -7,7 +9,15 @@ description = "A terminal workspace with batteries included"
 license = "MIT"
 repository = "https://github.com/zellij-org/zellij"
 homepage = "https://zellij.dev"
-include = ["src/**/*", "assets/layouts/*", "assets/config/*", "LICENSE.md", "README.md", "!**/*_test.*", "!**/tests/**/*"]
+include = [
+  "src/**/*",
+  "assets/layouts/*",
+  "assets/config/*",
+  "LICENSE.md",
+  "README.md",
+  "!**/*_test.*",
+  "!**/tests/**/*",
+]
 # NOTE: When updating this, modify `channel` in `rust-toolchain.toml` accordingly
 rust-version = "1.84"
 
@@ -25,13 +35,12 @@ interprocess = { workspace = true }
 log = { workspace = true }
 miette = { workspace = true }
 names = { workspace = true }
-nix = { workspace = true }
 suggest = { workspace = true }
 thiserror = { workspace = true }
 isahc = { workspace = true }
 
 [dev-dependencies]
-insta = { version = "1.6.0", features = ["backtrace"] }
+insta = { version = "1.6.0" }
 ssh2 = "0.9.1"
 rand = "0.8.0"
 regex = "1.8.1"
@@ -63,14 +72,17 @@ members = [
 ansi_term = { version = "0.12.1", default-features = false }
 anyhow = { version = "1.0.70", default-features = false, features = ["backtrace", "std"] }
 async-std = { version = "1.3.0", default-features = false, features = ["attributes", "default", "std", "unstable"] }
-clap = { version = "3.2.2", default-features = false, features = ["env", "derive", "color", "std", "suggestions"] }
+clap = { version = "4.4.6", default-features = false, features = ["env", "derive", "color", "std", "suggestions"] }
 daemonize = { version = "0.5", default-features = false }
 humantime = { version = "2.1.0", default-features = false }
 interprocess = { version = "1.2.1", default-features = false }
 isahc = { version = "1.7.2", default-features = false, features = ["http2", "text-decoding"] }
 lazy_static = { version = "1.4.0", default-features = false }
 libc = { version = "0.2", default-features = false, features = ["std"] }
-log = { version = "0.4.17", default-features = false }
+log = { version = "0.4.17", default-features = false, features = [
+    "max_level_trace",
+    "release_max_level_warn",
+] }
 miette = { version = "5.7.0", default-features = false, features = ["fancy"] }
 nix = { version = "0.23.1", default-features = false }
 notify-debouncer-full = { version = "0.3.1", default-features = false }
@@ -98,6 +110,9 @@ rmp-serde = { version = "1.1.0", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 zellij-utils = { path = "zellij-utils/", version = "0.43.0" }
 
+[target.'cfg(not(windows))'.dependencies]
+nix = { workspace = true }
+
 [profile.dev-opt]
 inherits = "dev"
 
@@ -112,15 +127,51 @@ strip = true
 depends = "$auto"
 license-file = ["LICENSE.md", "4"]
 assets = [
-  ["assets/man/zellij.1", "usr/share/man/man1/zellij.1", "644"],
-  ["target/release/zellij", "usr/bin/zellij", "755"],
-  ["GOVERNANCE.md", "usr/share/doc/zellij/GOVERNANCE.md", "644"],
-  ["README.md", "usr/share/doc/zellij/README.md", "644"],
-  ["assets/layouts/*", "usr/share/zellij/layouts/", "644"],
-  ["assets/plugins/*", "usr/share/zellij/plugins/", "644"],
-  ["assets/completions/zellij.bash", "usr/share/bash-completion/completions/zellij.bash", "644"],
-  ["assets/completions/zellij.fish", "usr/share/fish/vendor_completions.d/zellij.fish", "644"],
-  ["assets/completions/_zellij", "usr/share/zsh/vendor-completions/_zellij", "644"],
+  [
+    "assets/man/zellij.1",
+    "usr/share/man/man1/zellij.1",
+    "644",
+  ],
+  [
+    "target/release/zellij",
+    "usr/bin/zellij",
+    "755",
+  ],
+  [
+    "GOVERNANCE.md",
+    "usr/share/doc/zellij/GOVERNANCE.md",
+    "644",
+  ],
+  [
+    "README.md",
+    "usr/share/doc/zellij/README.md",
+    "644",
+  ],
+  [
+    "assets/layouts/*",
+    "usr/share/zellij/layouts/",
+    "644",
+  ],
+  [
+    "assets/plugins/*",
+    "usr/share/zellij/plugins/",
+    "644",
+  ],
+  [
+    "assets/completions/zellij.bash",
+    "usr/share/bash-completion/completions/zellij.bash",
+    "644",
+  ],
+  [
+    "assets/completions/zellij.fish",
+    "usr/share/fish/vendor_completions.d/zellij.fish",
+    "644",
+  ],
+  [
+    "assets/completions/_zellij",
+    "usr/share/zsh/vendor-completions/_zellij",
+    "644",
+  ],
 ]
 
 [package.metadata.binstall]
@@ -130,13 +181,14 @@ pkg-fmt = "tgz"
 
 [features]
 # See remarks in zellij_utils/Cargo.toml
-default = ["plugins_from_target", "vendored_curl", "web_server_capability"]
+# default = ["plugins_from_target", "vendored_curl", "web_server_capability"]
+default = ["plugins_from_target", "vendored_curl"]
 plugins_from_target = ["zellij-utils/plugins_from_target"]
 disable_automatic_asset_installation = ["zellij-utils/disable_automatic_asset_installation"]
 vendored_curl = ["zellij-utils/vendored_curl"]
 unstable = ["zellij-client/unstable", "zellij-utils/unstable"]
 singlepass = ["zellij-server/singlepass"]
-web_server_capability = ["zellij-client/web_server_capability", "zellij-server/web_server_capability", "zellij-utils/web_server_capability"]
+# web_server_capability = ["zellij-client/web_server_capability", "zellij-server/web_server_capability", "zellij-utils/web_server_capability"]
 
 # uncomment this when developing plugins in the Zellij UI to make plugin compilation faster
 # [profile.dev.package."*"]

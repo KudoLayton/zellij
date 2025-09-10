@@ -20,13 +20,10 @@ time = { version = "0.3", optional = true }
 tower-http = { version = "0.6.4", features = ["cors"], optional = true }
 
 anyhow = { workspace = true }
-daemonize = { workspace = true }
 interprocess = { workspace = true }
 lazy_static = { workspace = true }
-libc = { workspace = true }
 log = { workspace = true }
-mio = { version = "0.7.11", default-features = false, features = ['os-ext'] }
-nix = { workspace = true }
+mio = { version = "0.8.8", default-features = false, features = ['os-ext'] }
 notify = { workspace = true }
 rmp-serde = { workspace = true }
 regex = { workspace = true }
@@ -42,6 +39,19 @@ zellij-utils = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true }
+daemonize = { workspace = true }
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.52.0"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+]
+
 [dev-dependencies]
 insta = "1.6.0"
 isahc = { workspace = true }
@@ -53,12 +63,12 @@ serial_test = "3.0"
 
 [features]
 unstable = []
-web_server_capability = [
-    "dep:futures",
-    "dep:axum",
-    "dep:axum-extra",
-    "dep:time",
-    "dep:axum-server",
-    "dep:tower-http",
-    "zellij-utils/web_server_capability",
-]
+# web_server_capability = [
+#     "dep:futures",
+#     "dep:axum",
+#     "dep:axum-extra",
+#     "dep:time",
+#     "dep:axum-server",
+#     "dep:tower-http",
+#     "zellij-utils/web_server_capability",
+# ]

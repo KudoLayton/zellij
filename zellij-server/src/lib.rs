@@ -16,10 +16,12 @@ mod terminal_bytes;
 mod thread_bus;
 mod ui;
 
+#[cfg(unix)]
 pub use daemonize;
 
 use background_jobs::{background_jobs_main, BackgroundJob};
 use log::info;
+#[cfg(unix)]
 use nix::sys::stat::{umask, Mode};
 use pty_writer::{pty_writer_main, PtyWriteInstruction};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -317,6 +319,72 @@ impl SessionConfiguration {
     }
 }
 
+impl std::fmt::Display for ServerInstruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerInstruction::NewClient(..) => {
+                write!(f, "ServerInstruction::NewClient")
+            },
+            ServerInstruction::Render(..) => write!(f, "ServerInstruction::Render"),
+            ServerInstruction::UnblockInputThread => {
+                write!(f, "ServerInstruction::UnblockInputThread")
+            },
+            ServerInstruction::ClientExit(..) => write!(f, "ServerInstruction::ClientExit"),
+            ServerInstruction::RemoveClient(..) => write!(f, "ServerInstruction::RemoveClient"),
+            ServerInstruction::Error(..) => write!(f, "ServerInstruction::Error"),
+            ServerInstruction::KillSession => write!(f, "ServerInstruction::KillSession"),
+            ServerInstruction::DetachSession(..) => write!(f, "ServerInstruction::DetachSession"),
+            ServerInstruction::AttachClient(..) => {
+                write!(f, "ServerInstruction::AttachClient")
+            },
+            ServerInstruction::ConnStatus(..) => write!(f, "ServerInstruction::ConnStatus"),
+            ServerInstruction::Log(..) => write!(f, "ServerInstruction::Log"),
+            ServerInstruction::LogError(..) => write!(f, "ServerInstruction::LogError"),
+            ServerInstruction::SwitchSession(..) => write!(f, "ServerInstruction::SwitchSession"),
+            ServerInstruction::UnblockCliPipeInput(..) => {
+                write!(f, "ServerInstruction::UnblockCliPipeInput")
+            },
+            ServerInstruction::CliPipeOutput(..) => write!(f, "ServerInstruction::CliPipeOutput"),
+            ServerInstruction::AssociatePipeWithClient { .. } => {
+                write!(f, "ServerInstruction::AssociatePipeWithClient")
+            },
+            ServerInstruction::DisconnectAllClientsExcept(..) => {
+                write!(f, "ServerInstruction::DisconnectAllClientsExcept")
+            },
+            ServerInstruction::ChangeMode(..) => write!(f, "ServerInstruction::ChangeMode"),
+            ServerInstruction::ChangeModeForAllClients(..) => {
+                write!(f, "ServerInstruction::ChangeModeForAllClients")
+            },
+            ServerInstruction::Reconfigure { .. } => write!(f, "ServerInstruction::Reconfigure"),
+            ServerInstruction::ConfigWrittenToDisk(..) => {
+                write!(f, "ServerInstruction::ConfigWrittenToDisk")
+            },
+            ServerInstruction::FailedToWriteConfigToDisk(..) => {
+                write!(f, "ServerInstruction::FailedToWriteConfigToDisk")
+            },
+            ServerInstruction::RebindKeys { .. } => {
+                write!(f, "ServerInstruction::RebindKeys")
+            },
+            ServerInstruction::StartWebServer(..) => write!(f, "ServerInstruction::StartWebServer"),
+            ServerInstruction::ShareCurrentSession(..) => {
+                write!(f, "ServerInstruction::ShareCurrentSession")
+            },
+            ServerInstruction::StopSharingCurrentSession(..) => {
+                write!(f, "ServerInstruction::StopSharingCurrentSession")
+            },
+            ServerInstruction::SendWebClientsForbidden(..) => {
+                write!(f, "ServerInstruction::SendWebClientsForbidden")
+            },
+            ServerInstruction::WebServerStarted(..) => {
+                write!(f, "ServerInstruction::WebServerStarted")
+            },
+            ServerInstruction::FailedToStartWebServer(..) => {
+                write!(f, "ServerInstruction::FailedToStartWebServer")
+            },
+        }
+    }
+}
+
 pub(crate) struct SessionMetaData {
     pub senders: ThreadSenders,
     pub capabilities: PluginCapabilities,
@@ -580,14 +648,17 @@ impl SessionState {
 pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
     info!("Starting Zellij server!");
 
-    // preserve the current umask: read current value by setting to another mode, and then restoring it
-    let current_umask = umask(Mode::all());
-    umask(current_umask);
-    daemonize::Daemonize::new()
-        .working_directory(std::env::current_dir().unwrap())
-        .umask(current_umask.bits() as u32)
-        .start()
-        .expect("could not daemonize the server process");
+    #[cfg(unix)]
+    {
+        // preserve the current umask: read current value by setting to another mode, and then restoring it
+        let current_umask = umask(Mode::all());
+        umask(current_umask);
+        daemonize::Daemonize::new()
+            .working_directory(std::env::current_dir().unwrap())
+            .umask(current_umask.bits() as u32)
+            .start()
+            .expect("could not daemonize the server process");
+    }
 
     envs::set_zellij("0".to_string());
 
@@ -607,22 +678,13 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
     let _ = thread::Builder::new()
         .name("server_listener".to_string())
         .spawn({
-            use interprocess::local_socket::LocalSocketListener;
-            use zellij_utils::shared::set_permissions;
-
             let os_input = os_input.clone();
             let session_data = session_data.clone();
             let session_state = session_state.clone();
             let to_server = to_server.clone();
             let socket_path = socket_path.clone();
             move || {
-                drop(std::fs::remove_file(&socket_path));
-                let listener = LocalSocketListener::bind(&*socket_path).unwrap();
-                // set the sticky bit to avoid the socket file being potentially cleaned up
-                // https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html states that for XDG_RUNTIME_DIR:
-                // "To ensure that your files are not removed, they should have their access time timestamp modified at least once every 6 hours of monotonic time or the 'sticky' bit should be set on the file. "
-                // It is not guaranteed that all platforms allow setting the sticky bit on sockets!
-                drop(set_permissions(&socket_path, 0o1700));
+                let listener = zellij_utils::ipc::bind_server(&socket_path).unwrap();
                 for stream in listener.incoming() {
                     match stream {
                         Ok(stream) => {
@@ -658,6 +720,7 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
     loop {
         let (instruction, mut err_ctx) = server_receiver.recv().unwrap();
         err_ctx.add_call(ContextType::IPCServer((&instruction).into()));
+        log::debug!("Received ServerInstruction: {}", instruction);
         match instruction {
             ServerInstruction::NewClient(
                 // TODO: rename to FirstClientConnected?

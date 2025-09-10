@@ -3,9 +3,11 @@
 use std::{
     fs,
     io::{self, prelude::*},
-    os::unix::io::RawFd,
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
 
 use log::LevelFilter;
 
@@ -41,7 +43,7 @@ pub fn configure_logger() {
 
     // {n} means platform dependent newline
     // module is padded to exactly 25 bytes and thread is padded to be between 10 and 15 bytes.
-    let file_pattern = "{highlight({level:<6})} |{module:<25.25}| {date(%Y-%m-%d %H:%M:%S.%3f)} [{thread:<10.15}] [{file}:{line}]: {message} {n}";
+    let file_pattern = "{highlight({level:<6})} |{module:<25.25}| {date(%Y-%m-%d %H:%M:%S.%3f)} [{pid}:{thread:<10.15}] [{file}:{line}]: {message} {n}";
 
     // default zellij appender, should be used across most of the codebase.
     let log_file = RollingFileAppender::builder()
@@ -90,7 +92,11 @@ pub fn configure_logger() {
                 .additive(false)
                 .build("zellij_server::logging_pipe", LevelFilter::Trace),
         )
-        .build(Root::builder().appender("logFile").build(LevelFilter::Info))
+        .build(
+            Root::builder()
+                .appender("logFile")
+                .build(LevelFilter::Debug),
+        )
         .unwrap();
 
     let _ = log4rs::init_config(config).unwrap();
@@ -120,10 +126,24 @@ pub fn atomic_create_dir(dir_name: &Path) -> io::Result<()> {
     result
 }
 
+#[cfg(unix)]
 pub fn debug_to_file(message: &[u8], pid: RawFd) -> io::Result<()> {
     let mut path = PathBuf::new();
     path.push(&*ZELLIJ_TMP_LOG_DIR);
     path.push(format!("zellij-{}.log", pid));
+
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)?;
+    set_permissions(&path, 0o600)?;
+    file.write_all(message)
+}
+#[cfg(windows)]
+pub fn debug_to_file(message: &[u8]) -> io::Result<()> {
+    let mut path = PathBuf::new();
+    path.push(&*ZELLIJ_TMP_LOG_DIR);
+    path.push(format!("zellij-{}.log", "placeholder"));
 
     let mut file = fs::OpenOptions::new()
         .append(true)
