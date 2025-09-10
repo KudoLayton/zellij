@@ -1,4 +1,6 @@
 use crate::background_jobs::BackgroundJob;
+#[cfg(windows)]
+use crate::os_input_output::WinPtyReference;
 use crate::terminal_bytes::TerminalBytes;
 use crate::{
     panes::PaneId,
@@ -9,8 +11,13 @@ use crate::{
     ClientId, ServerInstruction,
 };
 use async_std::task::{self, JoinHandle};
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use std::{collections::HashMap, os::unix::io::RawFd, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf};
+#[cfg(windows)]
+use sysinfo::Pid;
+#[cfg(unix)]
 use zellij_utils::nix::unistd::Pid;
 use zellij_utils::{
     async_std,
@@ -132,11 +139,61 @@ impl From<&PtyInstruction> for PtyContext {
     }
 }
 
+impl std::fmt::Display for PtyInstruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PtyInstruction::SpawnTerminal(..) => write!(f, "PtyInstruction::SpawnTerminal"),
+            PtyInstruction::OpenInPlaceEditor(..) => {
+                write!(f, "PtyInstruction::OpenInPlaceEditor")
+            },
+            PtyInstruction::SpawnTerminalVertically(..) => {
+                write!(f, "PtyInstruction::SpawnTerminalVertically")
+            },
+            PtyInstruction::SpawnTerminalHorizontally(..) => {
+                write!(f, "PtyInstruction::SpawnTerminalHorizontally")
+            },
+            PtyInstruction::UpdateActivePane(..) => write!(f, "PtyInstruction::UpdateActivePane"),
+            PtyInstruction::GoToTab(..) => write!(f, "PtyInstruction::GoToTab"),
+            PtyInstruction::NewTab(..) => write!(f, "PtyInstruction::NewTab"),
+            PtyInstruction::ClosePane(..) => write!(f, "PtyInstruction::ClosePane"),
+            PtyInstruction::CloseTab(..) => write!(f, "PtyInstruction::CloseTab"),
+            PtyInstruction::ReRunCommandInPane(..) => {
+                write!(f, "PtyInstruction::ReRunCommandInPane")
+            },
+            PtyInstruction::DropToShellInPane { .. } => {
+                write!(f, "PtyInstruction::DropToShellInPane")
+            },
+            PtyInstruction::SpawnInPlaceTerminal(..) => {
+                write!(f, "PtyInstruction::SpawnInPlaceTerminal")
+            },
+            PtyInstruction::DumpLayout(..) => write!(f, "PtyInstruction::DumpLayout"),
+            PtyInstruction::DumpLayoutToPlugin(..) => {
+                write!(f, "PtyInstruction::DumpLayoutToPlugin")
+            },
+            PtyInstruction::LogLayoutToHd(..) => write!(f, "PtyInstruction::LogLayoutToHd"),
+            PtyInstruction::FillPluginCwd(..) => {
+                write!(f, "PtyInstruction::FillPluginCwd")
+            },
+            PtyInstruction::ListClientsMetadata(..) => {
+                write!(f, "PtyInstruction::ListClientsMetadata")
+            },
+            PtyInstruction::Reconfigure { .. } => write!(f, "PtyInstruction::Reconfigure"),
+            PtyInstruction::ListClientsToPlugin(..) => {
+                write!(f, "PtyInstruction::ListClientsToPlugin")
+            },
+            PtyInstruction::Exit => write!(f, "PtyInstruction::Exit"),
+        }
+    }
+}
+
 pub(crate) struct Pty {
     pub active_panes: HashMap<ClientId, PaneId>,
     pub bus: Bus<PtyInstruction>,
+    #[cfg(unix)]
     pub id_to_child_pid: HashMap<u32, RawFd>, // terminal_id => child raw fd
     originating_plugins: HashMap<u32, OriginatingPlugin>,
+    #[cfg(windows)]
+    pub id_to_child_pid: HashMap<u32, WinPtyReference>,
     debug_to_file: bool,
     task_handles: HashMap<u32, JoinHandle<()>>, // terminal_id to join-handle
     default_editor: Option<PathBuf>,
@@ -582,6 +639,41 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
             PtyInstruction::ReRunCommandInPane(pane_id, run_command) => {
                 let err_context = || format!("failed to rerun command in pane {:?}", pane_id);
 
+                #[cfg(windows)]
+                match pty
+                    .rerun_command_in_pane(pane_id, run_command.clone())
+                    .with_context(err_context)
+                {
+                    Ok(..) => {},
+                    Err(err) => match err.downcast_ref::<ZellijError>() {
+                        Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
+                            if run_command.hold_on_close {
+                                pty.bus
+                                    .senders
+                                    .send_to_screen(ScreenInstruction::PtyBytes(
+                                        *terminal_id,
+                                        format!(
+                                            "Command not found: {}",
+                                            run_command.command.display()
+                                        )
+                                        .as_bytes()
+                                        .to_vec(),
+                                    ))
+                                    .with_context(err_context)?;
+                                pty.bus
+                                    .senders
+                                    .send_to_screen(ScreenInstruction::HoldPane(
+                                        PaneId::Terminal(*terminal_id),
+                                        Some(2), // exit status
+                                        run_command,
+                                    ))
+                                    .with_context(err_context)?;
+                            }
+                        },
+                        _ => Err::<(), _>(err).non_fatal(),
+                    },
+                }
+                #[cfg(unix)]
                 match pty
                     .rerun_command_in_pane(pane_id, run_command.clone())
                     .with_context(err_context)
@@ -641,6 +733,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                     Err(err) => match err.downcast_ref::<ZellijError>() {
                         Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
                             if run_command.hold_on_close {
+                                #[cfg(unix)]
                                 pty.bus
                                     .senders
                                     .send_to_screen(ScreenInstruction::PtyBytes(
@@ -653,6 +746,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                                         .to_vec(),
                                     ))
                                     .with_context(err_context)?;
+                                #[cfg(unix)]
                                 pty.bus
                                     .senders
                                     .send_to_screen(ScreenInstruction::HoldPane(
@@ -767,6 +861,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 cwd,
                 floating_pane_coordinates,
             ) => {
+                #[cfg(unix)]
                 pty.fill_plugin_cwd(
                     should_float,
                     should_be_open_in_place,
@@ -851,22 +946,35 @@ impl Pty {
     fn fill_cwd(&self, terminal_action: &mut TerminalAction, client_id: ClientId) {
         if let TerminalAction::RunCommand(run_command) = terminal_action {
             if run_command.cwd.is_none() {
-                run_command.cwd = self
-                    .active_panes
-                    .get(&client_id)
-                    .and_then(|pane| match pane {
-                        PaneId::Plugin(..) => None,
-                        PaneId::Terminal(id) => self.id_to_child_pid.get(id),
-                    })
-                    .and_then(|&id| {
-                        self.bus
-                            .os_input
-                            .as_ref()
-                            .and_then(|input| input.get_cwd(Pid::from_raw(id)))
-                    });
+                run_command.cwd =
+                    self.active_panes
+                        .get(&client_id)
+                        .and_then(|pane| match pane {
+                            PaneId::Plugin(..) => None,
+                            PaneId::Terminal(id) => self.id_to_child_pid.get(id),
+                        })
+                        .and_then(|winptyreference| {
+                            #[cfg(windows)]
+                            {
+                                let pty = winptyreference.pty.read().unwrap();
+                                self.bus.os_input.as_ref().and_then(|input| {
+                                    input.get_cwd((pty.get_pid() as usize).into())
+                                })
+                            }
+                            #[cfg(unix)]
+                            {
+                                let pid = Pid::from_raw(id);
+                                self.bus
+                                    .os_input
+                                    .as_ref()
+                                    .and_then(|input| input.get_cwd(pid))
+                            }
+                        });
             };
         };
     }
+
+    #[cfg(unix)]
     fn fill_cwd_from_pane_id(&self, terminal_action: &mut TerminalAction, pane_id: &u32) {
         if let TerminalAction::RunCommand(run_command) = terminal_action {
             if run_command.cwd.is_none() {
@@ -879,6 +987,19 @@ impl Pty {
             };
         };
     }
+    #[cfg(windows)]
+    fn fill_cwd_from_pane_id(&self, terminal_action: &mut TerminalAction, pane_id: &u32) {
+        if let TerminalAction::RunCommand(run_command) = terminal_action {
+            if run_command.cwd.is_none() {
+                run_command.cwd = self.id_to_child_pid.get(pane_id).and_then(|winpty| {
+                    self.bus.os_input.as_ref().and_then(|input| {
+                        input.get_cwd(Pid::from(winpty.pty.read().unwrap().get_pid() as usize))
+                    })
+                });
+            };
+        };
+    }
+    #[cfg(unix)]
     pub fn spawn_terminal(
         &mut self,
         terminal_action: Option<TerminalAction>,
@@ -1016,6 +1137,106 @@ impl Pty {
         let starts_held = false;
         Ok((terminal_id, starts_held))
     }
+    #[cfg(windows)]
+    pub fn spawn_terminal(
+        &mut self,
+        terminal_action: Option<TerminalAction>,
+        client_or_tab_index: ClientTabIndexOrPaneId,
+    ) -> Result<(u32, bool)> {
+        // bool is starts_held
+        let err_context = || format!("failed to spawn terminal for {:?}", client_or_tab_index);
+
+        // returns the terminal id
+        let terminal_action = match client_or_tab_index {
+            ClientTabIndexOrPaneId::ClientId(client_id) => {
+                let mut terminal_action =
+                    terminal_action.unwrap_or_else(|| self.get_default_terminal(None, None));
+                self.fill_cwd(&mut terminal_action, client_id);
+                terminal_action
+            },
+            ClientTabIndexOrPaneId::TabIndex(_) => {
+                terminal_action.unwrap_or_else(|| self.get_default_terminal(None, None))
+            },
+            ClientTabIndexOrPaneId::PaneId(pane_id) => {
+                let mut terminal_action =
+                    terminal_action.unwrap_or_else(|| self.get_default_terminal(None, None));
+                if let PaneId::Terminal(terminal_pane_id) = pane_id {
+                    self.fill_cwd_from_pane_id(&mut terminal_action, &terminal_pane_id);
+                }
+                terminal_action
+            },
+        };
+        let (hold_on_start, hold_on_close) = match &terminal_action {
+            TerminalAction::RunCommand(run_command) => {
+                (run_command.hold_on_start, run_command.hold_on_close)
+            },
+            _ => (false, false),
+        };
+
+        if hold_on_start {
+            // we don't actually open a terminal in this case, just wait for the user to run it
+            let starts_held = hold_on_start;
+            let terminal_id = self
+                .bus
+                .os_input
+                .as_mut()
+                .context("couldn't get mutable reference to OS interface")
+                .and_then(|os_input| os_input.reserve_terminal_id())
+                .with_context(err_context)?;
+            return Ok((terminal_id, starts_held));
+        }
+
+        let quit_cb = Box::new({
+            let senders = self.bus.senders.clone();
+            move |pane_id, exit_status, command| {
+                if hold_on_close {
+                    let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
+                        pane_id,
+                        exit_status,
+                        command,
+                    ));
+                } else {
+                    let _ = senders.send_to_screen(ScreenInstruction::ClosePane(pane_id, None));
+                }
+            }
+        });
+        let (terminal_id, pty_reference): (u32, WinPtyReference) = self
+            .bus
+            .os_input
+            .as_mut()
+            .context("no OS I/O interface found")
+            .and_then(|os_input| {
+                os_input.spawn_terminal(terminal_action, quit_cb, self.default_editor.clone())
+            })
+            .with_context(err_context)?;
+        let terminal_bytes = task::spawn({
+            let err_context =
+                |terminal_id: u32| format!("failed to run async task for terminal {terminal_id}");
+            let senders = self.bus.senders.clone();
+            let os_input = self
+                .bus
+                .os_input
+                .as_ref()
+                .with_context(|| err_context(terminal_id))
+                .fatal()
+                .clone();
+            let debug_to_file = self.debug_to_file;
+            async move {
+                TerminalBytes::new(senders, os_input, debug_to_file, terminal_id)
+                    .listen()
+                    .await
+                    .with_context(|| err_context(terminal_id))
+                    .fatal();
+            }
+        });
+
+        self.task_handles.insert(terminal_id, terminal_bytes);
+        self.id_to_child_pid.insert(terminal_id, pty_reference);
+        let starts_held = false;
+        Ok((terminal_id, starts_held))
+    }
+
+    #[cfg(unix)]
     pub fn spawn_terminals_for_layout(
         &mut self,
         cwd: Option<PathBuf>,
@@ -1151,6 +1372,148 @@ impl Pty {
         }
         Ok(())
     }
+    #[cfg(windows)]
+    pub fn spawn_terminals_for_layout(
+        &mut self,
+        cwd: Option<PathBuf>,
+        layout: TiledPaneLayout,
+        floating_panes_layout: Vec<FloatingPaneLayout>,
+        default_shell: Option<TerminalAction>,
+        plugin_ids: HashMap<RunPluginOrAlias, Vec<u32>>,
+        tab_index: usize,
+        should_change_focus_to_new_tab: bool,
+        client_id: ClientId,
+    ) -> Result<()> {
+        let err_context = || format!("failed to spawn terminals for layout for client {client_id}");
+
+        let mut default_shell =
+            default_shell.unwrap_or_else(|| self.get_default_terminal(cwd, None));
+        self.fill_cwd(&mut default_shell, client_id);
+        let extracted_run_instructions = layout.extract_run_instructions();
+        let extracted_floating_run_instructions = floating_panes_layout
+            .iter()
+            .filter(|f| !f.already_running)
+            .map(|f| f.run.clone());
+        let mut new_pane_pids: Vec<(u32, bool, Option<RunCommand>, Result<u32>)> = vec![]; // (terminal_id,
+                                                                                           // starts_held,
+                                                                                           // run_command,
+                                                                                           // file_descriptor)
+        let mut new_floating_panes_pids: Vec<(u32, bool, Option<RunCommand>, Result<u32>)> = vec![]; // same
+                                                                                                     // as
+                                                                                                     // new_pane_pids
+        for run_instruction in extracted_run_instructions {
+            if let Some(new_pane_data) =
+                self.apply_run_instruction(run_instruction, default_shell.clone())?
+            {
+                let pd = (
+                    new_pane_data.0,
+                    new_pane_data.1,
+                    new_pane_data.2,
+                    new_pane_data.3,
+                );
+                new_pane_pids.push(pd);
+            }
+        }
+        for run_instruction in extracted_floating_run_instructions {
+            if let Some(new_pane_data) =
+                self.apply_run_instruction(run_instruction, default_shell.clone())?
+            {
+                let pd = (
+                    new_pane_data.0,
+                    new_pane_data.1,
+                    new_pane_data.2,
+                    new_pane_data.3,
+                );
+                new_floating_panes_pids.push(pd);
+            }
+        }
+        // Option<RunCommand> should only be Some if the pane starts held
+        let new_tab_pane_ids: Vec<(u32, Option<RunCommand>)> = new_pane_pids
+            .iter()
+            .map(|(terminal_id, starts_held, run_command, _)| {
+                if *starts_held {
+                    (*terminal_id, run_command.clone())
+                } else {
+                    (*terminal_id, None)
+                }
+            })
+            .collect();
+        let new_tab_floating_pane_ids: Vec<(u32, Option<RunCommand>)> = new_floating_panes_pids
+            .iter()
+            .map(|(terminal_id, starts_held, run_command, _)| {
+                if *starts_held {
+                    (*terminal_id, run_command.clone())
+                } else {
+                    (*terminal_id, None)
+                }
+            })
+            .collect();
+        self.bus
+            .senders
+            .send_to_screen(ScreenInstruction::ApplyLayout(
+                layout,
+                floating_panes_layout,
+                new_tab_pane_ids,
+                new_tab_floating_pane_ids,
+                plugin_ids,
+                tab_index,
+                should_change_focus_to_new_tab,
+                client_id,
+            ))
+            .with_context(err_context)?;
+        let mut terminals_to_start = vec![];
+        terminals_to_start.append(&mut new_pane_pids);
+        terminals_to_start.append(&mut new_floating_panes_pids);
+        for (terminal_id, starts_held, run_command, pid_primary) in terminals_to_start {
+            if starts_held {
+                // we do not run a command or start listening for bytes on held panes
+                continue;
+            }
+            match pid_primary {
+                Ok(pid_primary) => {
+                    let terminal_bytes = task::spawn({
+                        let senders = self.bus.senders.clone();
+                        let os_input = self
+                            .bus
+                            .os_input
+                            .as_ref()
+                            .with_context(err_context)?
+                            .clone();
+                        let debug_to_file = self.debug_to_file;
+                        async move {
+                            TerminalBytes::new(senders, os_input, debug_to_file, terminal_id)
+                                .listen()
+                                .await
+                                .context("failed to spawn terminals for layout")
+                                .fatal();
+                        }
+                    });
+                    self.task_handles.insert(terminal_id, terminal_bytes);
+                },
+                _ => match run_command {
+                    Some(run_command) => {
+                        if run_command.hold_on_close {
+                            send_command_not_found_to_screen(
+                                self.bus.senders.clone(),
+                                terminal_id,
+                                run_command.clone(),
+                            )
+                            .with_context(err_context)?;
+                        } else {
+                            self.close_pane(PaneId::Terminal(terminal_id))
+                                .with_context(err_context)?;
+                        }
+                    },
+                    None => {
+                        self.close_pane(PaneId::Terminal(terminal_id))
+                            .with_context(err_context)?;
+                    },
+                },
+            }
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
     fn apply_run_instruction(
         &mut self,
         run_instruction: Option<Run>,
@@ -1163,7 +1526,8 @@ impl Pty {
         let err_context = || format!("failed to apply run instruction");
         let quit_cb = Box::new({
             let senders = self.bus.senders.clone();
-            move |pane_id, _exit_status, _command| {
+            #[cfg(unix)]
+            move |pane_id, _exit_status: _, _command: _| {
                 let _ = senders.send_to_screen(ScreenInstruction::ClosePane(pane_id, None));
             }
         });
@@ -1214,6 +1578,7 @@ impl Pty {
                         Err(e) => Err(e),
                     }
                 } else {
+                    #[cfg(unix)]
                     match self
                         .bus
                         .os_input
@@ -1241,11 +1606,21 @@ impl Pty {
                             }
                         },
                     }
+                    #[cfg(windows)]
+                    todo!()
+                    // match self
+                    //     .bus
+                    //     .os_input
+                    //     .as_mut()
+                    //     .context("no OS I/O interface found")
+                    //     .with_context(err_context)?
+                    //     .spawn_terminal()
                 }
             },
             Some(Run::Cwd(cwd)) => {
                 let starts_held = false; // we do not hold Cwd panes
                 let shell = self.get_default_terminal(Some(cwd), Some(default_shell.clone()));
+                #[cfg(unix)]
                 match self
                     .bus
                     .os_input
@@ -1266,9 +1641,12 @@ impl Pty {
                         _ => Err(err),
                     },
                 }
+                #[cfg(windows)]
+                todo!()
             },
             Some(Run::EditFile(path_to_file, line_number, cwd)) => {
                 let starts_held = false; // we do not hold edit panes (for now?)
+                #[cfg(unix)]
                 match self
                     .bus
                     .os_input
@@ -1297,9 +1675,12 @@ impl Pty {
                         _ => Err(err),
                     },
                 }
+                #[cfg(windows)]
+                todo!()
             },
             None => {
                 let starts_held = false;
+                #[cfg(unix)]
                 match self
                     .bus
                     .os_input
@@ -1320,11 +1701,275 @@ impl Pty {
                         _ => Err(err),
                     },
                 }
+                #[cfg(windows)]
+                match self
+                    .bus
+                    .os_input
+                    .as_mut()
+                    .context("no OS I/O interface found")
+                    .with_context(err_context)?
+                    .spawn_terminal()
+                    .with_context(err_context)
+                {
+                    Ok((terminal_id, pid_primary, child_fd)) => {
+                        self.id_to_child_pid.insert(terminal_id, child_fd);
+                        Ok(Some((terminal_id, starts_held, None, Ok(pid_primary))))
+                    },
+                    Err(err) => match err.downcast_ref::<ZellijError>() {
+                        Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
+                            Ok(Some((*terminal_id, starts_held, None, Err(err))))
+                        },
+                        _ => Err(err),
+                    },
+                }
             },
             // Investigate moving plugin loading to here.
             Some(Run::Plugin(_)) => Ok(None),
         }
     }
+    #[cfg(windows)]
+    fn apply_run_instruction(
+        &mut self,
+        run_instruction: Option<Run>,
+        default_shell: TerminalAction,
+    ) -> Result<Option<(u32, bool, Option<RunCommand>, Result<u32>)>> {
+        // terminal_id,
+        // starts_held,
+        // command
+        // successfully opened
+
+        let err_context = || format!("failed to apply run instruction");
+        let quit_cb = Box::new({
+            let senders = self.bus.senders.clone();
+            move |pane_id, _exit_status: _, _command: _| {
+                let _ = senders.send_to_screen(ScreenInstruction::ClosePane(pane_id, None));
+            }
+        });
+        match run_instruction {
+            Some(Run::Command(mut command)) => {
+                let starts_held = command.hold_on_start;
+                let hold_on_close = command.hold_on_close;
+                let quit_cb = Box::new({
+                    let senders = self.bus.senders.clone();
+                    move |pane_id, exit_status, command| {
+                        if hold_on_close {
+                            let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
+                                pane_id,
+                                exit_status,
+                                command,
+                            ));
+                        } else {
+                            let _ =
+                                senders.send_to_screen(ScreenInstruction::ClosePane(pane_id, None));
+                        }
+                    }
+                });
+                if command.cwd.is_none() {
+                    if let TerminalAction::RunCommand(cmd) = default_shell {
+                        command.cwd = cmd.cwd;
+                    }
+                }
+                let cmd = TerminalAction::RunCommand(command.clone());
+                if starts_held {
+                    // we don't actually open a terminal in this case, just wait for the user to run it
+                    match self
+                        .bus
+                        .os_input
+                        .as_mut()
+                        .context("no OS I/O interface found")
+                        .with_context(err_context)?
+                        .reserve_terminal_id()
+                    {
+                        Ok(terminal_id) => {
+                            let tid = terminal_id.clone();
+                            Ok(Some((
+                                terminal_id,
+                                starts_held,
+                                Some(command.clone()),
+                                Ok(terminal_id), // this is not actually correct but gets
+                                                 // stripped later
+                            )))
+                        },
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    match self
+                        .bus
+                        .os_input
+                        .as_mut()
+                        .context("no OS I/O interface found")
+                        .with_context(err_context)?
+                        .spawn_terminal(cmd, quit_cb, self.default_editor.clone())
+                        .with_context(err_context)
+                    {
+                        Ok((terminal_id, reference)) => {
+                            self.id_to_child_pid.insert(terminal_id, reference.clone());
+                            Ok(Some((
+                                terminal_id,
+                                starts_held,
+                                Some(command.clone()),
+                                Ok(reference.pty.read().unwrap().get_pid()),
+                            )))
+                        },
+                        Err(err) => {
+                            match err.downcast_ref::<ZellijError>() {
+                                Some(ZellijError::CommandNotFound { terminal_id, .. }) => Ok(Some(
+                                    (*terminal_id, starts_held, Some(command.clone()), Err(err)),
+                                )),
+                                _ => Err(err),
+                            }
+                        },
+                    }
+                }
+            },
+            Some(Run::Cwd(cwd)) => {
+                let starts_held = false; // we do not hold Cwd panes
+                let shell = self.get_default_terminal(Some(cwd), Some(default_shell.clone()));
+                #[cfg(unix)]
+                match self
+                    .bus
+                    .os_input
+                    .as_mut()
+                    .context("no OS I/O interface found")
+                    .with_context(err_context)?
+                    .spawn_terminal(shell, quit_cb, self.default_editor.clone())
+                    .with_context(err_context)
+                {
+                    Ok((terminal_id, pid_primary, child_fd)) => {
+                        self.id_to_child_pid.insert(terminal_id, child_fd);
+                        Ok(Some((terminal_id, starts_held, None, Ok(pid_primary))))
+                    },
+                    Err(err) => match err.downcast_ref::<ZellijError>() {
+                        Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
+                            Ok(Some((*terminal_id, starts_held, None, Err(err))))
+                        },
+                        _ => Err(err),
+                    },
+                }
+                #[cfg(windows)]
+                todo!()
+            },
+            Some(Run::EditFile(path_to_file, line_number, cwd)) => {
+                let starts_held = false; // we do not hold edit panes (for now?)
+                #[cfg(unix)]
+                match self
+                    .bus
+                    .os_input
+                    .as_mut()
+                    .context("no OS I/O interface found")
+                    .with_context(err_context)?
+                    .spawn_terminal(
+                        TerminalAction::OpenFile(path_to_file, line_number, cwd),
+                        quit_cb,
+                        self.default_editor.clone(),
+                    )
+                    .with_context(err_context)
+                {
+                    Ok((terminal_id, pid_primary, child_fd)) => {
+                        self.id_to_child_pid.insert(terminal_id, child_fd);
+                        Ok(Some((terminal_id, starts_held, None, Ok(pid_primary))))
+                    },
+                    Err(err) => match err.downcast_ref::<ZellijError>() {
+                        Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
+                            Ok(Some((*terminal_id, starts_held, None, Err(err))))
+                        },
+                        _ => Err(err),
+                    },
+                }
+                #[cfg(windows)]
+                todo!()
+            },
+            None => {
+                let starts_held = false;
+                #[cfg(unix)]
+                match self
+                    .bus
+                    .os_input
+                    .as_mut()
+                    .context("no OS I/O interface found")
+                    .with_context(err_context)?
+                    .spawn_terminal(default_shell.clone(), quit_cb, self.default_editor.clone())
+                    .with_context(err_context)
+                {
+                    Ok((terminal_id, pid_primary, child_fd)) => {
+                        self.id_to_child_pid.insert(terminal_id, child_fd);
+                        Ok(Some((terminal_id, starts_held, None, Ok(pid_primary))))
+                    },
+                    Err(err) => match err.downcast_ref::<ZellijError>() {
+                        Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
+                            Ok(Some((*terminal_id, starts_held, None, Err(err))))
+                        },
+                        _ => Err(err),
+                    },
+                }
+                #[cfg(windows)]
+                match self
+                    .bus
+                    .os_input
+                    .as_mut()
+                    .context("no OS I/O interface found")
+                    .with_context(err_context)?
+                    .spawn_terminal(default_shell.clone(), quit_cb, self.default_editor.clone())
+                    .with_context(err_context)
+                {
+                    Ok((terminal_id, reference)) => {
+                        self.id_to_child_pid.insert(terminal_id, reference.clone());
+                        Ok(Some((
+                            terminal_id,
+                            starts_held,
+                            None,
+                            Ok(reference.pty.read().unwrap().get_pid()),
+                        )))
+                    },
+                    Err(err) => match err.downcast_ref::<ZellijError>() {
+                        Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
+                            Ok(Some((*terminal_id, starts_held, None, Err(err))))
+                        },
+                        _ => Err(err),
+                    },
+                }
+            },
+            // Investigate moving plugin loading to here.
+            Some(Run::Plugin(_)) => Ok(None),
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn close_pane(&mut self, id: PaneId) -> Result<()> {
+        let err_context = || format!("failed to close for pane {id:?}");
+        match id {
+            PaneId::Terminal(id) => {
+                self.task_handles.remove(&id);
+                if let Some(child_fd) = self.id_to_child_pid.remove(&id) {
+                    task::block_on(async {
+                        let err_context = || format!("failed to run async task for pane {id}");
+                        self.bus
+                            .os_input
+                            .as_mut()
+                            .with_context(err_context)
+                            .fatal()
+                            .kill(Pid::from(child_fd.pty.read().unwrap().get_pid() as usize))
+                            .with_context(err_context)
+                            .fatal();
+                    });
+                }
+                self.bus
+                    .os_input
+                    .as_ref()
+                    .context("no OS I/O interface found")
+                    .and_then(|os_input| os_input.clear_terminal_id(id))
+                    .with_context(err_context)?;
+            },
+            PaneId::Plugin(pid) => drop(
+                self.bus
+                    .senders
+                    .send_to_plugin(PluginInstruction::Unload(pid)),
+            ),
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     pub fn close_pane(&mut self, id: PaneId) -> Result<()> {
         let err_context = || format!("failed to close for pane {id:?}");
         match id {
@@ -1370,6 +2015,7 @@ impl Pty {
             self.active_panes.insert(client_id, pane_id);
         }
     }
+    #[cfg(unix)]
     pub fn rerun_command_in_pane(
         &mut self,
         pane_id: PaneId,
@@ -1463,6 +2109,16 @@ impl Pty {
             _ => Err(anyhow!("cannot respawn plugin panes")).with_context(err_context),
         }
     }
+
+    #[cfg(windows)]
+    pub fn rerun_command_in_pane(
+        &mut self,
+        pane_id: PaneId,
+        run_command: RunCommand,
+    ) -> Result<()> {
+        todo!()
+    }
+
     pub fn populate_session_layout_metadata(
         &self,
         session_layout_metadata: &mut SessionLayoutMetadata,
@@ -1474,7 +2130,7 @@ impl Pty {
         let pids: Vec<_> = terminal_ids
             .iter()
             .filter_map(|id| self.id_to_child_pid.get(&id))
-            .map(|pid| Pid::from_raw(*pid))
+            .map(|pid| Self::child_to_pid(pid))
             .collect();
         let pids_to_cwds = self
             .bus
@@ -1493,10 +2149,10 @@ impl Pty {
             let process_id = self.id_to_child_pid.get(&terminal_id);
             let cwd = process_id
                 .as_ref()
-                .and_then(|pid| pids_to_cwds.get(&Pid::from_raw(**pid)));
+                .and_then(|pid| pids_to_cwds.get(&Self::child_to_pid(&pid)));
             let cmd = process_id
                 .as_ref()
-                .and_then(|pid| ppids_to_cmds.get(&format!("{}", pid)));
+                .and_then(|pid| ppids_to_cmds.get(&format!("{}", Self::child_to_pid(pid))));
             if let Some(cmd) = cmd {
                 terminal_ids_to_commands.insert(terminal_id, cmd.clone());
             }
@@ -1509,6 +2165,8 @@ impl Pty {
         session_layout_metadata.update_terminal_cwds(terminal_ids_to_cwds);
         session_layout_metadata.update_default_editor(&self.default_editor)
     }
+
+    #[cfg(unix)]
     pub fn fill_plugin_cwd(
         &self,
         should_float: Option<bool>,
@@ -1563,9 +2221,31 @@ impl Pty {
     pub fn reconfigure(&mut self, default_editor: Option<PathBuf>) {
         self.default_editor = default_editor;
     }
+
+    #[cfg(windows)]
+    fn child_to_pid(child: &WinPtyReference) -> Pid {
+        /// TODO somehow support `Pid::from(WinPtyReference)`. This eliminates this special casing
+        Pid::from(child.pty.read().unwrap().get_pid() as usize)
+    }
+
+    #[cfg(unix)]
+    fn child_to_pid(child: &RawFd) -> Pid {
+        Pid::from(child)
+    }
 }
 
 impl Drop for Pty {
+    #[cfg(unix)]
+    fn drop(&mut self) {
+        let child_ids: Vec<u32> = self.id_to_child_pid.keys().copied().collect();
+        for id in child_ids {
+            self.close_pane(PaneId::Terminal(id))
+                .with_context(|| format!("failed to close pane for pid {id}"))
+                .fatal();
+        }
+    }
+
+    #[cfg(windows)]
     fn drop(&mut self) {
         let child_ids: Vec<u32> = self.id_to_child_pid.keys().copied().collect();
         for id in child_ids {
@@ -1601,8 +2281,15 @@ fn send_command_not_found_to_screen(
 }
 
 pub fn get_default_shell() -> PathBuf {
-    PathBuf::from(std::env::var("SHELL").unwrap_or_else(|_| {
+    #[cfg(unix)]
+    return PathBuf::from(std::env::var("SHELL").unwrap_or_else(|_| {
         log::warn!("Cannot read SHELL env, falling back to use /bin/sh");
         "/bin/sh".to_string()
+    }));
+
+    #[cfg(windows)]
+    PathBuf::from(std::env::var("SHELL").unwrap_or_else(|_| {
+        log::warn!("Cannot read SHELL env, falling back to use cmd");
+        "c:\\windows\\system32\\cmd.exe".to_string()
     }))
 }

@@ -2,7 +2,7 @@ use crate::input::actions::Action;
 use crate::input::config::ConversionError;
 use crate::input::keybinds::Keybinds;
 use crate::input::layout::{RunPlugin, SplitSize};
-use clap::ArgEnum;
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -990,7 +990,7 @@ impl PluginPermission {
     EnumIter,
     Serialize,
     Deserialize,
-    ArgEnum,
+    ValueEnum,
     PartialOrd,
     Ord,
 )]

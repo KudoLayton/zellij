@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 [package]
 name = "zellij"
 version = "0.41.2"
@@ -7,7 +9,15 @@ description = "A terminal workspace with batteries included"
 license = "MIT"
 repository = "https://github.com/zellij-org/zellij"
 homepage = "https://zellij.dev"
-include = ["src/**/*", "assets/layouts/*", "assets/config/*", "LICENSE.md", "README.md", "!**/*_test.*", "!**/tests/**/*"]
+include = [
+  "src/**/*",
+  "assets/layouts/*",
+  "assets/config/*",
+  "LICENSE.md",
+  "README.md",
+  "!**/*_test.*",
+  "!**/tests/**/*",
+]
 # NOTE: When updating this, modify `channel` in `rust-toolchain.toml` accordingly
 rust-version = "1.75"
 
@@ -24,7 +34,7 @@ dialoguer = "0.10.4"
 suggest = "0.4.0"
 
 [dev-dependencies]
-insta = { version = "1.6.0", features = ["backtrace"] }
+insta = { version = "1.6.0" }
 ssh2 = "0.9.1"
 rand = "0.8.0"
 regex = "1.8.1"
@@ -62,15 +72,51 @@ strip = true
 depends = "$auto"
 license-file = ["LICENSE.md", "4"]
 assets = [
-  ["assets/man/zellij.1", "usr/share/man/man1/zellij.1", "644"],
-  ["target/release/zellij", "usr/bin/zellij", "755"],
-  ["GOVERNANCE.md", "usr/share/doc/zellij/GOVERNANCE.md", "644"],
-  ["README.md", "usr/share/doc/zellij/README.md", "644"],
-  ["assets/layouts/*", "usr/share/zellij/layouts/", "644"],
-  ["assets/plugins/*", "usr/share/zellij/plugins/", "644"],
-  ["assets/completions/zellij.bash", "usr/share/bash-completion/completions/zellij.bash", "644"],
-  ["assets/completions/zellij.fish", "usr/share/fish/vendor_completions.d/zellij.fish", "644"],
-  ["assets/completions/_zellij", "usr/share/zsh/vendor-completions/_zellij", "644"],
+  [
+    "assets/man/zellij.1",
+    "usr/share/man/man1/zellij.1",
+    "644",
+  ],
+  [
+    "target/release/zellij",
+    "usr/bin/zellij",
+    "755",
+  ],
+  [
+    "GOVERNANCE.md",
+    "usr/share/doc/zellij/GOVERNANCE.md",
+    "644",
+  ],
+  [
+    "README.md",
+    "usr/share/doc/zellij/README.md",
+    "644",
+  ],
+  [
+    "assets/layouts/*",
+    "usr/share/zellij/layouts/",
+    "644",
+  ],
+  [
+    "assets/plugins/*",
+    "usr/share/zellij/plugins/",
+    "644",
+  ],
+  [
+    "assets/completions/zellij.bash",
+    "usr/share/bash-completion/completions/zellij.bash",
+    "644",
+  ],
+  [
+    "assets/completions/zellij.fish",
+    "usr/share/fish/vendor_completions.d/zellij.fish",
+    "644",
+  ],
+  [
+    "assets/completions/_zellij",
+    "usr/share/zsh/vendor-completions/_zellij",
+    "644",
+  ],
 ]
 
 [package.metadata.binstall]
