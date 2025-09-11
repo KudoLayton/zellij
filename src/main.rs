@@ -16,7 +16,17 @@ use zellij_utils::{
 fn main() {
     configure_logger();
     create_config_and_cache_folders();
+
+    #[cfg(unix)]
     let opts = CliArgs::parse();
+
+    #[cfg(windows)]
+    let opts = std::thread::Builder::new()
+        .stack_size(15 * 1024 * 1024)
+        .spawn(CliArgs::parse)
+        .unwrap()
+        .join()
+        .unwrap();
 
     {
         let config = Config::try_from(&opts).ok();
