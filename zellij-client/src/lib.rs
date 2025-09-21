@@ -170,6 +170,7 @@ fn spawn_web_server(_cli_args: &CliArgs) -> Result<String, String> {
     Ok("".to_owned())
 }
 
+#[cfg(unix)]
 pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
     let mut cmd = Command::new(current_exe()?);
     cmd.arg("--server");
@@ -177,29 +178,39 @@ pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
     if debug {
         cmd.arg("--debug");
     }
-    #[cfg(unix)]
-    {
-        let status = cmd.status()?;
+    let status = cmd.status()?;
 
-        if status.success() {
-            Ok(())
-        } else {
-            let msg = "Process returned non-zero exit code";
-            let err_msg = match status.code() {
-                Some(c) => format!("{}: {}", msg, c),
-                None => msg.to_string(),
-            };
-            Err(io::Error::new(io::ErrorKind::Other, err_msg))
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let _status = cmd
-            .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
-            .spawn()?;
+    if status.success() {
         Ok(())
+    } else {
+        let msg = "Process returned non-zero exit code";
+        let err_msg = match status.code() {
+            Some(c) => format!("{}: {}", msg, c),
+            None => msg.to_string(),
+        };
+        Err(io::Error::new(io::ErrorKind::Other, err_msg))
     }
+}
+
+#[cfg(windows)]
+pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
+    let mut cmd = Command::new("powershell");
+    cmd.arg("-NoProfile");
+    cmd.arg("-Command");
+    cmd.arg("Start-Process");
+    cmd.arg("-FilePath");
+    cmd.arg(current_exe()?);
+    cmd.arg("-ArgumentList \"");
+    cmd.arg("--server");
+    cmd.arg(socket_path);
+    if debug {
+        cmd.arg("--debug");
+    }
+    cmd.arg("\"");
+    cmd.arg("-WindowStyle");
+    cmd.arg("Hidden");
+    let _status = cmd.spawn()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
