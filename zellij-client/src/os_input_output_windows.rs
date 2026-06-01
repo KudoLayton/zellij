@@ -299,28 +299,42 @@ impl WindowsConsoleWriter {
             if ok == 0 {
                 return Err(io::Error::last_os_error());
             }
+            if written == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "WriteConsoleW wrote zero UTF-16 code units",
+                ));
+            }
             offset += written as usize;
         }
         Ok(())
+    }
+
+    fn write_pending_valid_prefix(&mut self) -> io::Result<()> {
+        let pending = std::mem::take(&mut self.pending_utf8);
+        let split = split_valid_utf8_prefix(&pending);
+        if !split.valid.is_empty() {
+            let text = String::from_utf8_lossy(split.valid);
+            self.write_utf16(&text)?;
+        }
+        self.pending_utf8.extend_from_slice(split.pending);
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) -> io::Result<()> {
+        self.write_pending_valid_prefix()
     }
 }
 
 impl Write for WindowsConsoleWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.pending_utf8.extend_from_slice(buf);
-        let pending = std::mem::take(&mut self.pending_utf8);
-        let split = split_valid_utf8_prefix(&pending);
-        if !split.valid.is_empty() {
-            let text = std::str::from_utf8(split.valid)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            self.write_utf16(text)?;
-        }
-        self.pending_utf8.extend_from_slice(split.pending);
+        self.write_pending_valid_prefix()?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.flush_pending()
     }
 }
 
