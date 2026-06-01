@@ -1402,7 +1402,7 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                     let _ = os_input.send_to_client(
                         *client_id,
                         ServerToClientMsg::Exit {
-                            exit_reason: ExitReason::Normal,
+                            exit_reason: detach_exit_reason(),
                         },
                     );
                     remove_client!(*client_id, os_input, session_state, session_data);
@@ -2342,6 +2342,10 @@ mod detach_tests {
 pub fn get_engine() -> Engine {
     log::info!("Loading plugins using Wasmi interpreter");
     Engine::default()
+}
+
+fn detach_exit_reason() -> ExitReason {
+    ExitReason::NormalDetached
 }
 
 // TODO: move elsewhere
