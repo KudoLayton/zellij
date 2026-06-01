@@ -247,3 +247,26 @@ pub(crate) fn disable_mouse_support(stdout: &mut dyn Write) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_prefix_split_keeps_incomplete_codepoint_pending() {
+        let bytes = "a한".as_bytes();
+        let split = split_valid_utf8_prefix(&bytes[..bytes.len() - 1]);
+
+        assert_eq!(split.valid, b"a");
+        assert_eq!(split.pending, &bytes[1..bytes.len() - 1]);
+    }
+
+    #[test]
+    fn utf8_prefix_split_accepts_complete_codepoints() {
+        let bytes = "a한".as_bytes();
+        let split = split_valid_utf8_prefix(bytes);
+
+        assert_eq!(split.valid, bytes);
+        assert!(split.pending.is_empty());
+    }
+}
