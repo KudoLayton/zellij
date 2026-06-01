@@ -1214,4 +1214,10 @@ mod tests {
         assert_eq!(dsr.drain_deferred_to_len(16), b"fter");
         assert!(dsr.is_done());
     }
+
+    #[test]
+    fn sigint_for_known_child_uses_ctrl_c_stdin_byte() {
+        assert_eq!(sigint_payload_for_child_pid(42, 42), Some(&b"\x03"[..]));
+        assert_eq!(sigint_payload_for_child_pid(42, 7), None);
+    }
 }
