@@ -14,6 +14,7 @@ use std::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 
 use tokio::io::AsyncReadExt;
@@ -59,7 +60,10 @@ const E_HANDLE_HRESULT: i32 = 0x80070006_u32 as i32;
 const ERROR_BROKEN_PIPE_HRESULT: i32 = 0x8007006d_u32 as i32;
 const DSR_QUERY: &[u8] = b"\x1b[6n";
 const DSR_RESPONSE: &[u8] = b"\x1b[1;1R";
-const MAX_DSR_BOOTSTRAP_READS: usize = 8;
+const DEFAULT_DSR_BOOTSTRAP_TIMEOUT_MS: u64 = 200;
+const MIN_DSR_BOOTSTRAP_TIMEOUT_MS: u64 = 50;
+const MAX_DSR_BOOTSTRAP_TIMEOUT_MS: u64 = 2_000;
+const DSR_BOOTSTRAP_TIMEOUT_ENV: &str = "ZELLIJ_DSR_BOOTSTRAP_TIMEOUT_MS";
 
 /// Monotonic counter so each ConPTY output pipe gets a unique name, even when
 /// re-spawning on the same `terminal_id` (the old async reader may still hold
@@ -175,6 +179,15 @@ impl AsyncReader for ConPtyAsyncReader {
         if let Some(bytes_read) = self.drain_buffered_output(buf) {
             return Ok(bytes_read);
         }
+        if let Some(dsr_bootstrap) = self.dsr_bootstrap.as_mut() {
+            if let Some(bytes_read) = dsr_bootstrap.drain_deferred(buf.len()) {
+                buf[..bytes_read.len()].copy_from_slice(&bytes_read);
+                if dsr_bootstrap.is_done() {
+                    self.dsr_bootstrap = None;
+                }
+                return Ok(bytes_read.len());
+            }
+        }
         if let Some(handle) = self.pending.take() {
             let pipe = unsafe { NamedPipeServer::from_raw_handle(handle.into_raw_handle()) }?;
             self.pipe = Some(pipe);
@@ -189,7 +202,7 @@ impl AsyncReader for ConPtyAsyncReader {
                 return Ok(0);
             }
             if let Some(dsr_bootstrap) = self.dsr_bootstrap.as_mut() {
-                let filtered = dsr_bootstrap.filter(&buf[..bytes_read]);
+                let filtered = dsr_bootstrap.filter_to_len(&buf[..bytes_read], buf.len());
                 if dsr_bootstrap.is_done() {
                     self.dsr_bootstrap = None;
                 }
@@ -209,8 +222,10 @@ impl AsyncReader for ConPtyAsyncReader {
 
 struct DsrBootstrap {
     input_write_handle: HANDLE,
-    reads_remaining: usize,
-    answered: bool,
+    deadline: Instant,
+    completed: bool,
+    pending: Vec<u8>,
+    deferred: VecDeque<u8>,
 }
 
 unsafe impl Send for DsrBootstrap {}
@@ -220,33 +235,118 @@ impl DsrBootstrap {
     fn new(input_write_handle: HANDLE) -> Self {
         Self {
             input_write_handle,
-            reads_remaining: MAX_DSR_BOOTSTRAP_READS,
-            answered: false,
+            deadline: Instant::now() + configured_dsr_bootstrap_timeout(),
+            completed: false,
+            pending: Vec::new(),
+            deferred: VecDeque::new(),
         }
     }
 
     fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.reads_remaining = self.reads_remaining.saturating_sub(1);
-        let (filtered, found_dsr) = strip_dsr_query_once(bytes);
-        if found_dsr && !self.answered {
-            self.answered = true;
-            let mut written = 0;
-            unsafe {
-                WriteFile(
-                    self.input_write_handle,
-                    DSR_RESPONSE.as_ptr(),
-                    DSR_RESPONSE.len() as u32,
-                    &mut written,
-                    std::ptr::null_mut(),
-                );
-            }
+        self.filter_to_len(bytes, usize::MAX)
+    }
+
+    fn filter_to_len(&mut self, bytes: &[u8], max_len: usize) -> Vec<u8> {
+        if self.completed || Instant::now() > self.deadline {
+            self.completed = true;
+            let output = self.emit_with_pending(bytes);
+            return self.defer_output_tail(output, max_len);
         }
-        filtered
+
+        let mut combined = Vec::with_capacity(self.pending.len() + bytes.len());
+        combined.extend_from_slice(&self.pending);
+        combined.extend_from_slice(bytes);
+
+        if let Some(index) = find_subslice(&combined, DSR_QUERY) {
+            self.completed = true;
+            self.pending.clear();
+            let mut output = Vec::with_capacity(combined.len() - DSR_QUERY.len());
+            output.extend_from_slice(&combined[..index]);
+            output.extend_from_slice(&combined[index + DSR_QUERY.len()..]);
+            self.write_dsr_response();
+            return self.defer_output_tail(output, max_len);
+        }
+
+        let pending_len = partial_dsr_prefix_len(&combined);
+        self.pending.clear();
+        self.pending
+            .extend_from_slice(&combined[combined.len() - pending_len..]);
+        self.defer_output_tail(combined[..combined.len() - pending_len].to_vec(), max_len)
+    }
+
+    fn drain_deferred(&mut self, max_len: usize) -> Option<Vec<u8>> {
+        if self.deferred.is_empty() {
+            return None;
+        }
+        let len = max_len.min(self.deferred.len());
+        Some(self.deferred.drain(..len).collect())
+    }
+
+    fn drain_deferred_to_len(&mut self, max_len: usize) -> Vec<u8> {
+        self.drain_deferred(max_len).unwrap_or_default()
+    }
+
+    fn emit_with_pending(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if self.pending.is_empty() {
+            return bytes.to_vec();
+        }
+        let mut output = Vec::with_capacity(self.pending.len() + bytes.len());
+        output.extend_from_slice(&self.pending);
+        output.extend_from_slice(bytes);
+        self.pending.clear();
+        output
+    }
+
+    fn defer_output_tail(&mut self, output: Vec<u8>, max_len: usize) -> Vec<u8> {
+        let len = max_len.min(output.len());
+        self.deferred.extend(output[len..].iter().copied());
+        output[..len].to_vec()
+    }
+
+    fn write_dsr_response(&self) {
+        if self.input_write_handle.is_null() {
+            return;
+        }
+        let mut written = 0;
+        unsafe {
+            WriteFile(
+                self.input_write_handle,
+                DSR_RESPONSE.as_ptr(),
+                DSR_RESPONSE.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            );
+        }
     }
 
     fn is_done(&self) -> bool {
-        self.answered || self.reads_remaining == 0
+        self.completed && self.pending.is_empty() && self.deferred.is_empty()
     }
+}
+
+fn configured_dsr_bootstrap_timeout() -> Duration {
+    let millis = env::var(DSR_BOOTSTRAP_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DSR_BOOTSTRAP_TIMEOUT_MS)
+        .clamp(
+            MIN_DSR_BOOTSTRAP_TIMEOUT_MS,
+            MAX_DSR_BOOTSTRAP_TIMEOUT_MS,
+        );
+    Duration::from_millis(millis)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn partial_dsr_prefix_len(bytes: &[u8]) -> usize {
+    (1..DSR_QUERY.len())
+        .rev()
+        .find(|len| bytes.ends_with(&DSR_QUERY[..*len]))
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
