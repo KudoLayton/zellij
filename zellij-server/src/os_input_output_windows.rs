@@ -49,6 +49,8 @@ const PIPE_WAIT: u32 = 0;
 const GENERIC_WRITE: u32 = 0x40000000;
 const PASSTHROUGH_MIN_BUILD: u32 = 22_621;
 const DISABLE_PASSTHROUGH_ENV: &str = "ZELLIJ_CONPTY_NO_PASSTHROUGH";
+const E_HANDLE_HRESULT: i32 = 0x80070006_u32 as i32;
+const ERROR_BROKEN_PIPE_HRESULT: i32 = 0x8007006d_u32 as i32;
 
 /// Monotonic counter so each ConPTY output pipe gets a unique name, even when
 /// re-spawning on the same `terminal_id` (the old async reader may still hold
@@ -90,6 +92,15 @@ impl BitOr for ConPtyFlags {
     }
 }
 
+impl ConPtyTerminal {
+    fn close_pseudoconsole(&mut self) {
+        if self.hpcon != 0 {
+            unsafe { ClosePseudoConsole(self.hpcon) };
+            self.hpcon = 0;
+        }
+    }
+}
+
 // HANDLE/HPCON are raw pointers in windows-sys >= 0.59; OS handles are
 // safe to send across threads.
 unsafe impl Send for ConPtyTerminal {}
@@ -101,7 +112,7 @@ impl Drop for ConPtyTerminal {
             // Close the pseudo console first — it may write a final VT frame
             // to the output pipe. The async reader task (if still alive) will
             // drain it. Then close the remaining handle.
-            ClosePseudoConsole(self.hpcon);
+            self.close_pseudoconsole();
             CloseHandle(self.input_write_handle);
         }
     }
@@ -239,6 +250,10 @@ fn fallback_conpty_flags(flags: ConPtyFlags) -> Option<ConPtyFlags> {
     } else {
         None
     }
+}
+
+fn is_benign_resize_after_exit_hresult(hr: i32) -> bool {
+    matches!(hr, E_HANDLE_HRESULT | ERROR_BROKEN_PIPE_HRESULT)
 }
 
 fn selected_conpty_flags() -> ConPtyFlags {
@@ -560,6 +575,7 @@ impl WindowsPtyBackend {
         // Send. Windows OS handles are safe to use cross-thread.
         let cmd_for_monitor = cmd.clone();
         let process_handle_addr = process_handle as usize;
+        let terminals_for_monitor = self.terminals.clone();
         std::thread::spawn(move || {
             let process_handle = process_handle_addr as HANDLE;
             let exit_code = unsafe {
@@ -569,6 +585,9 @@ impl WindowsPtyBackend {
                 CloseHandle(process_handle);
                 code
             };
+            if let Some(Some(term)) = terminals_for_monitor.lock().unwrap().get_mut(&terminal_id) {
+                term.close_pseudoconsole();
+            }
             quit_cb(
                 PaneId::Terminal(terminal_id),
                 Some(exit_code as i32),
@@ -636,7 +655,13 @@ impl WindowsPtyBackend {
                         Y: rows as i16,
                     };
                     let hr = unsafe { ResizePseudoConsole(term.hpcon, size) };
-                    if hr != S_OK {
+                    if hr != S_OK && is_benign_resize_after_exit_hresult(hr) {
+                        log::debug!(
+                            "ResizePseudoConsole after terminal {} exit: HRESULT 0x{:08x}",
+                            terminal_id,
+                            hr
+                        );
+                    } else if hr != S_OK {
                         Err::<(), _>(anyhow!("ResizePseudoConsole failed: HRESULT 0x{:08x}", hr))
                             .with_context(err_context)
                             .non_fatal();
