@@ -219,8 +219,8 @@ impl ClientOsApi for ClientOsInputOutput {
         }
         #[cfg(not(windows))]
         {
-        let stdout = ::std::io::stdout();
-        Box::new(stdout)
+            let stdout = ::std::io::stdout();
+            Box::new(stdout)
         }
     }
 

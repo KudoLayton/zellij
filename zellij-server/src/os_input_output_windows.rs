@@ -7,9 +7,9 @@ use std::{
     ffi::OsStr,
     io,
     mem::size_of,
+    ops::BitOr,
     os::windows::ffi::OsStrExt,
     os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle},
-    ops::BitOr,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
@@ -28,8 +28,8 @@ use windows_sys::Win32::System::Console::{
     CTRL_C_EVENT, HPCON,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
-    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, CreatePipe};
@@ -352,8 +352,7 @@ fn command_uses_powershell(cmd: &RunCommand) -> bool {
 }
 
 fn child_process_creation_flags(breakaway_from_job: bool) -> u32 {
-    let mut flags =
-        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
+    let mut flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
     if breakaway_from_job {
         flags |= CREATE_BREAKAWAY_FROM_JOB;
     }
@@ -988,7 +987,11 @@ impl WindowsPtyBackend {
 
     fn terminate_job_for_pid(&self, pid: u32) -> Result<bool> {
         let err_context = || format!("failed to terminate job for pid {}", pid);
-        let terminals = self.terminals.lock().to_anyhow().with_context(err_context)?;
+        let terminals = self
+            .terminals
+            .lock()
+            .to_anyhow()
+            .with_context(err_context)?;
         if let Some(term) = terminals
             .values()
             .filter_map(|terminal| terminal.as_ref())
@@ -1052,15 +1055,9 @@ mod tests {
 
     #[test]
     fn resize_after_exit_errors_are_benign() {
-        assert!(is_benign_resize_after_exit_hresult(
-            0x80070006_u32 as i32
-        ));
-        assert!(is_benign_resize_after_exit_hresult(
-            0x8007006d_u32 as i32
-        ));
-        assert!(!is_benign_resize_after_exit_hresult(
-            0x80070057_u32 as i32
-        ));
+        assert!(is_benign_resize_after_exit_hresult(0x80070006_u32 as i32));
+        assert!(is_benign_resize_after_exit_hresult(0x8007006d_u32 as i32));
+        assert!(!is_benign_resize_after_exit_hresult(0x80070057_u32 as i32));
     }
 
     #[test]
