@@ -793,4 +793,17 @@ mod tests {
         );
         assert_eq!(fallback_conpty_flags(ConPtyFlags::empty()), None);
     }
+
+    #[test]
+    fn resize_after_exit_errors_are_benign() {
+        assert!(is_benign_resize_after_exit_hresult(
+            0x80070006_u32 as i32
+        ));
+        assert!(is_benign_resize_after_exit_hresult(
+            0x8007006d_u32 as i32
+        ));
+        assert!(!is_benign_resize_after_exit_hresult(
+            0x80070057_u32 as i32
+        ));
+    }
 }
