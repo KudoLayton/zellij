@@ -249,10 +249,6 @@ impl DsrBootstrap {
         }
     }
 
-    fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.filter_to_len(bytes, usize::MAX)
-    }
-
     fn filter_to_len(&mut self, bytes: &[u8], max_len: usize) -> Vec<u8> {
         if self.completed || Instant::now() > self.deadline {
             self.completed = true;
@@ -289,6 +285,12 @@ impl DsrBootstrap {
         Some(self.deferred.drain(..len).collect())
     }
 
+    #[cfg(test)]
+    fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.filter_to_len(bytes, usize::MAX)
+    }
+
+    #[cfg(test)]
     fn drain_deferred_to_len(&mut self, max_len: usize) -> Vec<u8> {
         self.drain_deferred(max_len).unwrap_or_default()
     }
@@ -434,6 +436,7 @@ fn build_environment_block(terminal_id: u32) -> Vec<u16> {
     block
 }
 
+#[cfg(test)]
 fn strip_dsr_query_once(bytes: &[u8]) -> (Vec<u8>, bool) {
     if let Some(index) = bytes
         .windows(DSR_QUERY.len())
