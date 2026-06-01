@@ -1263,4 +1263,25 @@ mod tests {
         assert_eq!(sigint_payload_for_child_pid(42, 42), Some(&b"\x03"[..]));
         assert_eq!(sigint_payload_for_child_pid(42, 7), None);
     }
+
+    #[test]
+    fn passthrough_spawn_invalid_parameter_requests_conpty_recreate() {
+        let passthrough = ConPtyFlags::RESIZE_QUIRK
+            | ConPtyFlags::WIN32_INPUT_MODE
+            | ConPtyFlags::PASSTHROUGH_MODE;
+        let no_passthrough = ConPtyFlags::RESIZE_QUIRK | ConPtyFlags::WIN32_INPUT_MODE;
+
+        assert!(should_recreate_without_passthrough(
+            passthrough,
+            &io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32)
+        ));
+        assert!(!should_recreate_without_passthrough(
+            no_passthrough,
+            &io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32)
+        ));
+        assert!(!should_recreate_without_passthrough(
+            passthrough,
+            &io::Error::from_raw_os_error(5)
+        ));
+    }
 }
