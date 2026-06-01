@@ -27,6 +27,7 @@ use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use zellij_utils::errors::FatalError;
@@ -65,6 +66,43 @@ const DISABLE_HOST_THEME_NOTIFY: &str = "\u{1b}[?2031l";
 /// same `CSI ? 997 ; {1|2} n` form as unsolicited notifications, so the
 /// stdin parser handles both uniformly.
 const QUERY_HOST_THEME: &str = "\u{1b}[?996n";
+
+#[derive(Clone, Debug)]
+struct TerminalCleanupGuard {
+    started: Arc<AtomicBool>,
+}
+
+impl TerminalCleanupGuard {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn mark_started(&self) -> bool {
+        !self.started.swap(true, Ordering::SeqCst)
+    }
+
+    fn run(
+        &self,
+        os_input: &dyn ClientOsApi,
+        message: &str,
+        rows: usize,
+        include_kitty_exit: bool,
+    ) -> bool {
+        if !self.mark_started() {
+            return false;
+        }
+        os_input.disable_mouse().non_fatal();
+        os_input.unset_raw_mode().unwrap();
+        os_input.restore_console_mode();
+        let teardown_message = terminal_teardown_message(message, rows, include_kitty_exit);
+        let mut stdout = os_input.get_stdout_writer();
+        stdout.write_all(teardown_message.as_bytes()).unwrap();
+        stdout.flush().unwrap();
+        true
+    }
+}
 
 /// Spawn an async runtime for this client instance.
 ///
@@ -769,6 +807,7 @@ pub fn start_client(
     config.env.set_vars();
 
     let full_screen_ws = os_input.get_terminal_size();
+    let terminal_cleanup = TerminalCleanupGuard::new();
 
     let web_server_ip = config_options
         .web_server_ip
@@ -971,10 +1010,12 @@ pub fn start_client(
         use zellij_utils::errors::handle_panic;
         let send_client_instructions = send_client_instructions.clone();
         let os_input = os_input.clone();
+        let terminal_cleanup = terminal_cleanup.clone();
         Box::new(move |info| {
-            os_input.disable_mouse().non_fatal();
-            os_input.restore_console_mode();
-            if let Ok(()) = os_input.unset_raw_mode() {
+            if terminal_cleanup.mark_started() {
+                os_input.disable_mouse().non_fatal();
+                os_input.restore_console_mode();
+                let _ = os_input.unset_raw_mode();
                 handle_panic(info, Some(&send_client_instructions));
             }
         })
@@ -1111,17 +1152,12 @@ pub fn start_client(
         .unwrap();
 
     let handle_error = |backtrace: String| {
-        os_input.disable_mouse().non_fatal();
-        os_input.unset_raw_mode().unwrap();
-        os_input.restore_console_mode();
-        let error = terminal_teardown_message(
+        terminal_cleanup.run(
+            &*os_input,
             &backtrace,
             full_screen_ws.rows,
             !explicitly_disable_kitty_keyboard_protocol,
         );
-        let mut stdout = os_input.get_stdout_writer();
-        stdout.write_all(error.as_bytes()).unwrap();
-        stdout.flush().unwrap();
         std::process::exit(1);
     };
 
@@ -1256,19 +1292,13 @@ pub fn start_client(
     router_thread.join().unwrap();
 
     if reconnect_to_session.is_none() {
-        let goodbye_message = terminal_teardown_message(
+        terminal_cleanup.run(
+            &*os_input,
             &exit_msg,
             full_screen_ws.rows,
             !explicitly_disable_kitty_keyboard_protocol,
         );
-
-        os_input.disable_mouse().non_fatal();
         info!("{}", exit_msg);
-        os_input.unset_raw_mode().unwrap();
-        os_input.restore_console_mode();
-        let mut stdout = os_input.get_stdout_writer();
-        stdout.write_all(goodbye_message.as_bytes()).unwrap();
-        stdout.flush().unwrap();
     } else {
         let clear_screen = "\u{1b}[2J";
         let mut stdout = os_input.get_stdout_writer();
