@@ -60,6 +60,7 @@ const E_HANDLE_HRESULT: i32 = 0x80070006_u32 as i32;
 const ERROR_BROKEN_PIPE_HRESULT: i32 = 0x8007006d_u32 as i32;
 const DSR_QUERY: &[u8] = b"\x1b[6n";
 const DSR_RESPONSE: &[u8] = b"\x1b[1;1R";
+const CTRL_C_STDIN: &[u8] = b"\x03";
 const DEFAULT_DSR_BOOTSTRAP_TIMEOUT_MS: u64 = 200;
 const MIN_DSR_BOOTSTRAP_TIMEOUT_MS: u64 = 50;
 const MAX_DSR_BOOTSTRAP_TIMEOUT_MS: u64 = 2_000;
@@ -347,6 +348,10 @@ fn partial_dsr_prefix_len(bytes: &[u8]) -> usize {
         .rev()
         .find(|len| bytes.ends_with(&DSR_QUERY[..*len]))
         .unwrap_or(0)
+}
+
+fn sigint_payload_for_child_pid(child_pid: u32, requested_pid: u32) -> Option<&'static [u8]> {
+    (child_pid == requested_pid).then_some(CTRL_C_STDIN)
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,6 +1065,9 @@ impl WindowsPtyBackend {
     }
 
     pub fn send_sigint(&self, pid: u32) -> Result<()> {
+        if self.write_sigint_to_child_stdin(pid)? {
+            return Ok(());
+        }
         let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid) };
         if ok != 0 {
             Ok(())
@@ -1099,6 +1107,41 @@ impl WindowsPtyBackend {
         {
             terminate_job(term.job_handle).with_context(err_context)?;
             Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn write_sigint_to_child_stdin(&self, pid: u32) -> Result<bool> {
+        let err_context = || format!("failed to send SIGINT to pid {}", pid);
+        let terminals = self
+            .terminals
+            .lock()
+            .to_anyhow()
+            .with_context(err_context)?;
+        if let Some((term, payload)) = terminals
+            .values()
+            .filter_map(|terminal| terminal.as_ref())
+            .find_map(|terminal| {
+                sigint_payload_for_child_pid(terminal.child_pid, pid)
+                    .map(|payload| (terminal, payload))
+            })
+        {
+            let mut written: u32 = 0;
+            let ok = unsafe {
+                WriteFile(
+                    term.input_write_handle,
+                    payload.as_ptr(),
+                    payload.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                Err(io::Error::last_os_error()).with_context(err_context)
+            } else {
+                Ok(true)
+            }
         } else {
             Ok(false)
         }
