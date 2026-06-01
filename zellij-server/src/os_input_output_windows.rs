@@ -968,4 +968,16 @@ mod tests {
                 | CREATE_BREAKAWAY_FROM_JOB
         );
     }
+
+    #[test]
+    fn dsr_bootstrap_strips_initial_query_without_losing_output() {
+        assert_eq!(
+            strip_dsr_query_once(b"hello\x1b[6nworld"),
+            (b"helloworld".to_vec(), true)
+        );
+        assert_eq!(
+            strip_dsr_query_once(b"hello world"),
+            (b"hello world".to_vec(), false)
+        );
+    }
 }
