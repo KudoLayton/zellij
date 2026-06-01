@@ -1086,4 +1086,32 @@ mod tests {
             (b"hello world".to_vec(), false)
         );
     }
+
+    #[test]
+    fn dsr_bootstrap_detects_query_split_across_reads() {
+        let mut dsr = DsrBootstrap::new(std::ptr::null_mut());
+
+        assert_eq!(dsr.filter(b"before\x1b["), b"before");
+        assert_eq!(dsr.filter(b"6nafter"), b"after");
+        assert!(dsr.is_done());
+    }
+
+    #[test]
+    fn dsr_bootstrap_replays_false_partial_query_prefix() {
+        let mut dsr = DsrBootstrap::new(std::ptr::null_mut());
+
+        assert_eq!(dsr.filter(b"before\x1b["), b"before");
+        assert_eq!(dsr.filter(b"XXafter"), b"\x1b[XXafter");
+        assert!(!dsr.is_done());
+    }
+
+    #[test]
+    fn dsr_bootstrap_defers_output_that_does_not_fit_read_buffer() {
+        let mut dsr = DsrBootstrap::new(std::ptr::null_mut());
+        let output = dsr.filter_to_len(b"before\x1b[6nafter", 7);
+
+        assert_eq!(output, b"beforea");
+        assert_eq!(dsr.drain_deferred_to_len(16), b"fter");
+        assert!(dsr.is_done());
+    }
 }
