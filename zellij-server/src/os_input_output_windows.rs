@@ -336,10 +336,7 @@ fn configured_dsr_bootstrap_timeout() -> Duration {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_DSR_BOOTSTRAP_TIMEOUT_MS)
-        .clamp(
-            MIN_DSR_BOOTSTRAP_TIMEOUT_MS,
-            MAX_DSR_BOOTSTRAP_TIMEOUT_MS,
-        );
+        .clamp(MIN_DSR_BOOTSTRAP_TIMEOUT_MS, MAX_DSR_BOOTSTRAP_TIMEOUT_MS);
     Duration::from_millis(millis)
 }
 
@@ -497,8 +494,7 @@ fn conpty_flags_without_passthrough() -> ConPtyFlags {
 }
 
 fn should_recreate_without_passthrough(flags: ConPtyFlags, error: &io::Error) -> bool {
-    flags.uses_passthrough()
-        && error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)
+    flags.uses_passthrough() && error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)
 }
 
 fn selected_conpty_flags() -> ConPtyFlags {
@@ -630,10 +626,7 @@ impl ConPtySpawnState {
     }
 }
 
-fn create_terminal_conpty(
-    terminal_id: u32,
-    flags: ConPtyFlags,
-) -> io::Result<ConPtySpawnState> {
+fn create_terminal_conpty(terminal_id: u32, flags: ConPtyFlags) -> io::Result<ConPtySpawnState> {
     let (output_read, output_write) = create_overlapped_output_pipe(terminal_id)?;
 
     let mut input_read: HANDLE = std::ptr::null_mut();
