@@ -831,4 +831,19 @@ mod tests {
             0x80070057_u32 as i32
         ));
     }
+
+    #[test]
+    fn child_process_spawn_flags_start_suspended_and_can_break_away() {
+        assert_eq!(
+            child_process_creation_flags(false),
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED
+        );
+        assert_eq!(
+            child_process_creation_flags(true),
+            EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_UNICODE_ENVIRONMENT
+                | CREATE_SUSPENDED
+                | CREATE_BREAKAWAY_FROM_JOB
+        );
+    }
 }
