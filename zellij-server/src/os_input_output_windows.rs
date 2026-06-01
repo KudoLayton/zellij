@@ -27,13 +27,19 @@ use windows_sys::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, GenerateConsoleCtrlEvent, ResizePseudoConsole, COORD,
     CTRL_C_EVENT, HPCON,
 };
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
+    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, CreatePipe};
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOEXW;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, OpenProcess, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    PROCESS_INFORMATION, PROCESS_TERMINATE, STARTUPINFOEXW, STARTUPINFOW,
+    InitializeProcThreadAttributeList, OpenProcess, ResumeThread, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+    PROCESS_TERMINATE, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 use zellij_utils::{errors::prelude::*, input::command::RunCommand};
@@ -61,6 +67,8 @@ static PIPE_SEQ: AtomicU64 = AtomicU64::new(0);
 struct ConPtyTerminal {
     hpcon: HPCON,
     input_write_handle: HANDLE,
+    job_handle: HANDLE,
+    child_pid: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +122,7 @@ impl Drop for ConPtyTerminal {
             // drain it. Then close the remaining handle.
             self.close_pseudoconsole();
             CloseHandle(self.input_write_handle);
+            CloseHandle(self.job_handle);
         }
     }
 }
@@ -232,6 +241,15 @@ fn build_environment_block(terminal_id: u32) -> Vec<u16> {
     block.push(0);
     block.push(0); // double-null terminator
     block
+}
+
+fn child_process_creation_flags(breakaway_from_job: bool) -> u32 {
+    let mut flags =
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
+    if breakaway_from_job {
+        flags |= CREATE_BREAKAWAY_FROM_JOB;
+    }
+    flags
 }
 
 fn select_conpty_flags(windows_build: u32, passthrough_disabled: bool) -> ConPtyFlags {
@@ -372,14 +390,72 @@ unsafe extern "system" {
     fn RtlGetVersion(version_information: *mut OSVERSIONINFOEXW) -> i32;
 }
 
+fn create_kill_on_close_job() -> io::Result<HANDLE> {
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let ok = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &mut info as *mut _ as *mut core::ffi::c_void,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if ok == 0 {
+        let error = io::Error::last_os_error();
+        unsafe { CloseHandle(job) };
+        Err(error)
+    } else {
+        Ok(job)
+    }
+}
+
+fn assign_process_to_job(job: HANDLE, process: HANDLE) -> io::Result<()> {
+    let ok = unsafe { AssignProcessToJobObject(job, process) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn terminate_job(job: HANDLE) -> io::Result<()> {
+    let ok = unsafe { TerminateJobObject(job, 1) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Spawn a child process attached to the given ConPTY.
 ///
-/// Returns `(process_handle, thread_handle, child_pid)`.
+/// Returns `(process_handle, thread_handle, child_pid, job_handle)`.
 fn spawn_child_process(
     hpcon: HPCON,
     cmd: &RunCommand,
     terminal_id: u32,
-) -> io::Result<(HANDLE, HANDLE, u32)> {
+) -> io::Result<(HANDLE, HANDLE, u32, HANDLE)> {
+    spawn_child_process_attempt(hpcon, cmd, terminal_id, false).or_else(|first_error| {
+        log::debug!(
+            "Failed to assign child process to job; retrying with CREATE_BREAKAWAY_FROM_JOB: {}",
+            first_error
+        );
+        spawn_child_process_attempt(hpcon, cmd, terminal_id, true)
+    })
+}
+
+fn spawn_child_process_attempt(
+    hpcon: HPCON,
+    cmd: &RunCommand,
+    terminal_id: u32,
+    breakaway_from_job: bool,
+) -> io::Result<(HANDLE, HANDLE, u32, HANDLE)> {
     // --- proc thread attribute list ---
     let mut attr_size: usize = 0;
     unsafe {
@@ -436,6 +512,7 @@ fn spawn_child_process(
     let cwd_ptr = cwd.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let job = create_kill_on_close_job()?;
 
     let ok = unsafe {
         CreateProcessW(
@@ -444,7 +521,7 @@ fn spawn_child_process(
             std::ptr::null(),      // lpProcessAttributes
             std::ptr::null(),      // lpThreadAttributes
             0,                     // bInheritHandles = FALSE
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            child_process_creation_flags(breakaway_from_job),
             env_block.as_ptr().cast(),              // lpEnvironment
             cwd_ptr,                                // lpCurrentDirectory
             &si.StartupInfo as *const STARTUPINFOW, // lpStartupInfo
@@ -455,10 +532,32 @@ fn spawn_child_process(
     unsafe { DeleteProcThreadAttributeList(attr_list) };
 
     if ok == 0 {
+        unsafe { CloseHandle(job) };
         return Err(io::Error::last_os_error());
     }
 
-    Ok((pi.hProcess, pi.hThread, pi.dwProcessId))
+    if let Err(e) = assign_process_to_job(job, pi.hProcess) {
+        unsafe {
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            CloseHandle(job);
+        }
+        return Err(e);
+    }
+
+    if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
+        let error = io::Error::last_os_error();
+        let _ = terminate_job(job);
+        unsafe {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            CloseHandle(job);
+        }
+        return Err(error);
+    }
+
+    Ok((pi.hProcess, pi.hThread, pi.dwProcessId, job))
 }
 
 fn terminate_process(pid: u32) -> std::result::Result<(), std::io::Error> {
@@ -545,7 +644,7 @@ impl WindowsPtyBackend {
         }
 
         // 5. Spawn child process
-        let (process_handle, thread_handle, child_pid) =
+        let (process_handle, thread_handle, child_pid, job_handle) =
             match spawn_child_process(hpcon, &cmd, terminal_id) {
                 Ok(r) => r,
                 Err(e) => {
@@ -567,6 +666,8 @@ impl WindowsPtyBackend {
             Some(ConPtyTerminal {
                 hpcon,
                 input_write_handle: input_write,
+                job_handle,
+                child_pid,
             }),
         );
 
@@ -735,11 +836,17 @@ impl WindowsPtyBackend {
     }
 
     pub fn kill(&self, pid: u32) -> Result<()> {
+        if self.terminate_job_for_pid(pid)? {
+            return Ok(());
+        }
         terminate_process(pid).with_context(|| format!("failed to kill pid {}", pid))?;
         Ok(())
     }
 
     pub fn force_kill(&self, pid: u32) -> Result<()> {
+        if self.terminate_job_for_pid(pid)? {
+            return Ok(());
+        }
         terminate_process(pid).with_context(|| format!("failed to force-kill pid {}", pid))?;
         Ok(())
     }
@@ -768,6 +875,21 @@ impl WindowsPtyBackend {
             self.next_terminal_id_counter
                 .fetch_add(1, Ordering::Relaxed),
         )
+    }
+
+    fn terminate_job_for_pid(&self, pid: u32) -> Result<bool> {
+        let err_context = || format!("failed to terminate job for pid {}", pid);
+        let terminals = self.terminals.lock().to_anyhow().with_context(err_context)?;
+        if let Some(term) = terminals
+            .values()
+            .filter_map(|terminal| terminal.as_ref())
+            .find(|terminal| terminal.child_pid == pid)
+        {
+            terminate_job(term.job_handle).with_context(err_context)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
