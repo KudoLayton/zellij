@@ -647,3 +647,52 @@ impl WindowsPtyBackend {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conpty_flags_include_resize_and_win32_input_by_default() {
+        let flags = select_conpty_flags(22621, false);
+
+        assert!(flags.contains(ConPtyFlags::RESIZE_QUIRK));
+        assert!(flags.contains(ConPtyFlags::WIN32_INPUT_MODE));
+        assert!(flags.contains(ConPtyFlags::PASSTHROUGH_MODE));
+    }
+
+    #[test]
+    fn conpty_flags_skip_passthrough_on_older_windows_builds() {
+        let flags = select_conpty_flags(19045, false);
+
+        assert!(flags.contains(ConPtyFlags::RESIZE_QUIRK));
+        assert!(flags.contains(ConPtyFlags::WIN32_INPUT_MODE));
+        assert!(!flags.contains(ConPtyFlags::PASSTHROUGH_MODE));
+    }
+
+    #[test]
+    fn conpty_flags_allow_passthrough_to_be_disabled() {
+        let flags = select_conpty_flags(22621, true);
+
+        assert!(flags.contains(ConPtyFlags::RESIZE_QUIRK));
+        assert!(flags.contains(ConPtyFlags::WIN32_INPUT_MODE));
+        assert!(!flags.contains(ConPtyFlags::PASSTHROUGH_MODE));
+    }
+
+    #[test]
+    fn conpty_flags_fallback_removes_passthrough_first() {
+        let flags = ConPtyFlags::RESIZE_QUIRK
+            | ConPtyFlags::WIN32_INPUT_MODE
+            | ConPtyFlags::PASSTHROUGH_MODE;
+
+        assert_eq!(
+            fallback_conpty_flags(flags),
+            Some(ConPtyFlags::RESIZE_QUIRK | ConPtyFlags::WIN32_INPUT_MODE)
+        );
+        assert_eq!(
+            fallback_conpty_flags(ConPtyFlags::RESIZE_QUIRK | ConPtyFlags::WIN32_INPUT_MODE),
+            Some(ConPtyFlags::empty())
+        );
+        assert_eq!(fallback_conpty_flags(ConPtyFlags::empty()), None);
+    }
+}
