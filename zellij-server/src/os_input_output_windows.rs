@@ -3,10 +3,13 @@ use crate::panes::PaneId;
 
 use std::{
     collections::BTreeMap,
+    env,
     ffi::OsStr,
     io,
+    mem::size_of,
     os::windows::ffi::OsStrExt,
     os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle},
+    ops::BitOr,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
@@ -25,6 +28,7 @@ use windows_sys::Win32::System::Console::{
     CTRL_C_EVENT, HPCON,
 };
 use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, CreatePipe};
+use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOEXW;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, OpenProcess, TerminateProcess, UpdateProcThreadAttribute,
@@ -43,6 +47,8 @@ const PIPE_ACCESS_INBOUND: u32 = 0x00000001;
 const PIPE_TYPE_BYTE: u32 = 0;
 const PIPE_WAIT: u32 = 0;
 const GENERIC_WRITE: u32 = 0x40000000;
+const PASSTHROUGH_MIN_BUILD: u32 = 22_621;
+const DISABLE_PASSTHROUGH_ENV: &str = "ZELLIJ_CONPTY_NO_PASSTHROUGH";
 
 /// Monotonic counter so each ConPTY output pipe gets a unique name, even when
 /// re-spawning on the same `terminal_id` (the old async reader may still hold
@@ -53,6 +59,35 @@ static PIPE_SEQ: AtomicU64 = AtomicU64::new(0);
 struct ConPtyTerminal {
     hpcon: HPCON,
     input_write_handle: HANDLE,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConPtyFlags(u32);
+
+impl ConPtyFlags {
+    const RESIZE_QUIRK: Self = Self(0x2);
+    const WIN32_INPUT_MODE: Self = Self(0x4);
+    const PASSTHROUGH_MODE: Self = Self(0x8);
+
+    const fn empty() -> Self {
+        Self(0)
+    }
+
+    const fn bits(self) -> u32 {
+        self.0
+    }
+
+    const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl BitOr for ConPtyFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
 }
 
 // HANDLE/HPCON are raw pointers in windows-sys >= 0.59; OS handles are
@@ -188,6 +223,50 @@ fn build_environment_block(terminal_id: u32) -> Vec<u16> {
     block
 }
 
+fn select_conpty_flags(windows_build: u32, passthrough_disabled: bool) -> ConPtyFlags {
+    let mut flags = ConPtyFlags::RESIZE_QUIRK | ConPtyFlags::WIN32_INPUT_MODE;
+    if !passthrough_disabled && windows_build >= PASSTHROUGH_MIN_BUILD {
+        flags = flags | ConPtyFlags::PASSTHROUGH_MODE;
+    }
+    flags
+}
+
+fn fallback_conpty_flags(flags: ConPtyFlags) -> Option<ConPtyFlags> {
+    if flags.contains(ConPtyFlags::PASSTHROUGH_MODE) {
+        Some(ConPtyFlags::RESIZE_QUIRK | ConPtyFlags::WIN32_INPUT_MODE)
+    } else if flags.bits() != 0 {
+        Some(ConPtyFlags::empty())
+    } else {
+        None
+    }
+}
+
+fn selected_conpty_flags() -> ConPtyFlags {
+    let passthrough_disabled = env_flag(DISABLE_PASSTHROUGH_ENV);
+    let windows_build = current_windows_build().unwrap_or_else(|e| {
+        log::debug!("Failed to detect Windows build for ConPTY flags: {}", e);
+        0
+    });
+    select_conpty_flags(windows_build, passthrough_disabled)
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn current_windows_build() -> io::Result<u32> {
+    let mut info: OSVERSIONINFOEXW = unsafe { std::mem::zeroed() };
+    info.dwOSVersionInfoSize = size_of::<OSVERSIONINFOEXW>() as u32;
+    let status = unsafe { RtlGetVersion(&mut info) };
+    if status < 0 {
+        Err(io::Error::from_raw_os_error(status))
+    } else {
+        Ok(info.dwBuildNumber)
+    }
+}
+
 /// Create an overlapped named-pipe pair for ConPTY output.
 ///
 /// Returns `(server_read_handle, client_write_handle)` where the server
@@ -251,12 +330,31 @@ fn create_conpty(
         Y: rows as i16,
     };
     let mut hpcon: HPCON = 0;
-    let hr = unsafe { CreatePseudoConsole(size, input_read, output_write, 0, &mut hpcon) };
-    if hr != S_OK {
-        Err(io::Error::from_raw_os_error(hr))
-    } else {
-        Ok(hpcon)
+    let mut flags = selected_conpty_flags();
+    loop {
+        let hr = unsafe {
+            CreatePseudoConsole(size, input_read, output_write, flags.bits(), &mut hpcon)
+        };
+        if hr == S_OK {
+            return Ok(hpcon);
+        }
+        if let Some(fallback_flags) = fallback_conpty_flags(flags) {
+            log::debug!(
+                "CreatePseudoConsole failed with flags 0x{:x} (HRESULT 0x{:08x}); retrying with 0x{:x}",
+                flags.bits(),
+                hr,
+                fallback_flags.bits()
+            );
+            flags = fallback_flags;
+        } else {
+            return Err(io::Error::from_raw_os_error(hr));
+        }
     }
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn RtlGetVersion(version_information: *mut OSVERSIONINFOEXW) -> i32;
 }
 
 /// Spawn a child process attached to the given ConPTY.
