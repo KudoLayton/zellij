@@ -370,4 +370,17 @@ mod tests {
         assert_eq!(split.valid, bytes);
         assert!(split.pending.is_empty());
     }
+
+    #[test]
+    fn console_writer_flush_keeps_split_codepoint_pending() {
+        let glyph = "é".as_bytes();
+        let mut writer = WindowsConsoleWriter {
+            handle: std::ptr::null_mut(),
+            pending_utf8: glyph[..1].to_vec(),
+        };
+
+        writer.flush_pending().expect("split utf8 waits");
+
+        assert_eq!(writer.pending_utf8, glyph[..1]);
+    }
 }
