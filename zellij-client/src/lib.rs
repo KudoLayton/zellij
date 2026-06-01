@@ -1428,4 +1428,18 @@ fn terminal_teardown_message(message: &str, rows: usize, include_kitty_exit: boo
 }
 
 #[cfg(test)]
+mod terminal_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_cleanup_guard_runs_only_once() {
+        let guard = TerminalCleanupGuard::new();
+
+        assert!(guard.mark_started());
+        assert!(!guard.mark_started());
+        assert!(!guard.clone().mark_started());
+    }
+}
+
+#[cfg(test)]
 mod unit;
