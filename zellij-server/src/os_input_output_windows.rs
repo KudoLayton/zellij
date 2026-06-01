@@ -20,7 +20,9 @@ use std::{
 use tokio::io::AsyncReadExt;
 use tokio::net::windows::named_pipe::NamedPipeServer;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, INVALID_HANDLE_VALUE, S_OK,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
 };
@@ -97,6 +99,10 @@ impl ConPtyFlags {
 
     const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    const fn uses_passthrough(self) -> bool {
+        self.contains(Self::PASSTHROUGH_MODE)
     }
 }
 
@@ -486,6 +492,15 @@ fn is_benign_resize_after_exit_hresult(hr: i32) -> bool {
     matches!(hr, E_HANDLE_HRESULT | ERROR_BROKEN_PIPE_HRESULT)
 }
 
+fn conpty_flags_without_passthrough() -> ConPtyFlags {
+    ConPtyFlags::RESIZE_QUIRK | ConPtyFlags::WIN32_INPUT_MODE
+}
+
+fn should_recreate_without_passthrough(flags: ConPtyFlags, error: &io::Error) -> bool {
+    flags.uses_passthrough()
+        && error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)
+}
+
 fn selected_conpty_flags() -> ConPtyFlags {
     let passthrough_disabled = env_flag(DISABLE_PASSTHROUGH_ENV);
     let windows_build = current_windows_build().unwrap_or_else(|e| {
@@ -564,24 +579,25 @@ fn create_overlapped_output_pipe(terminal_id: u32) -> io::Result<(HANDLE, HANDLE
 
 /// Create a ConPTY pseudo console of the given size attached to the provided
 /// pipes.
-fn create_conpty(
+fn create_conpty_with_flags(
     cols: u16,
     rows: u16,
     input_read: HANDLE,
     output_write: HANDLE,
-) -> io::Result<HPCON> {
+    initial_flags: ConPtyFlags,
+) -> io::Result<(HPCON, ConPtyFlags)> {
     let size = COORD {
         X: cols as i16,
         Y: rows as i16,
     };
     let mut hpcon: HPCON = 0;
-    let mut flags = selected_conpty_flags();
+    let mut flags = initial_flags;
     loop {
         let hr = unsafe {
             CreatePseudoConsole(size, input_read, output_write, flags.bits(), &mut hpcon)
         };
         if hr == S_OK {
-            return Ok(hpcon);
+            return Ok((hpcon, flags));
         }
         if let Some(fallback_flags) = fallback_conpty_flags(flags) {
             log::debug!(
@@ -595,6 +611,65 @@ fn create_conpty(
             return Err(io::Error::from_raw_os_error(hr));
         }
     }
+}
+
+struct ConPtySpawnState {
+    output_read: HANDLE,
+    input_write: HANDLE,
+    hpcon: HPCON,
+    flags: ConPtyFlags,
+}
+
+impl ConPtySpawnState {
+    fn close(self) {
+        unsafe {
+            ClosePseudoConsole(self.hpcon);
+            CloseHandle(self.input_write);
+            CloseHandle(self.output_read);
+        }
+    }
+}
+
+fn create_terminal_conpty(
+    terminal_id: u32,
+    flags: ConPtyFlags,
+) -> io::Result<ConPtySpawnState> {
+    let (output_read, output_write) = create_overlapped_output_pipe(terminal_id)?;
+
+    let mut input_read: HANDLE = std::ptr::null_mut();
+    let mut input_write: HANDLE = std::ptr::null_mut();
+    if unsafe { CreatePipe(&mut input_read, &mut input_write, std::ptr::null(), 0) } == 0 {
+        unsafe {
+            CloseHandle(output_read);
+            CloseHandle(output_write);
+        }
+        return Err(io::Error::last_os_error());
+    }
+
+    let (hpcon, flags) = match create_conpty_with_flags(80, 24, input_read, output_write, flags) {
+        Ok(result) => result,
+        Err(e) => {
+            unsafe {
+                CloseHandle(output_read);
+                CloseHandle(output_write);
+                CloseHandle(input_read);
+                CloseHandle(input_write);
+            }
+            return Err(e);
+        },
+    };
+
+    unsafe {
+        CloseHandle(input_read);
+        CloseHandle(output_write);
+    }
+
+    Ok(ConPtySpawnState {
+        output_read,
+        input_write,
+        hpcon,
+        flags,
+    })
 }
 
 #[link(name = "ntdll")]
@@ -820,54 +895,29 @@ impl WindowsPtyBackend {
             )
         };
 
-        // 1. Output pipe pair (named, overlapped read end for IOCP)
-        let (output_read, output_write) =
-            create_overlapped_output_pipe(terminal_id).with_context(|| err_context(&cmd))?;
+        let mut conpty = create_terminal_conpty(terminal_id, selected_conpty_flags())
+            .with_context(|| err_context(&cmd))?;
 
-        // 2. Input pipe pair (anonymous, both synchronous)
-        let mut input_read: HANDLE = std::ptr::null_mut();
-        let mut input_write: HANDLE = std::ptr::null_mut();
-        if unsafe { CreatePipe(&mut input_read, &mut input_write, std::ptr::null(), 0) } == 0 {
-            unsafe {
-                CloseHandle(output_read);
-                CloseHandle(output_write);
-            }
-            return Err(io::Error::last_os_error()).with_context(|| err_context(&cmd));
-        }
-
-        // 3. Create pseudo console
-        let hpcon = match create_conpty(80, 24, input_read, output_write) {
-            Ok(h) => h,
-            Err(e) => {
-                unsafe {
-                    CloseHandle(output_read);
-                    CloseHandle(output_write);
-                    CloseHandle(input_read);
-                    CloseHandle(input_write);
+        let spawn_result = spawn_child_process(conpty.hpcon, &cmd, terminal_id);
+        let (process_handle, thread_handle, child_pid, job_handle) = match spawn_result {
+            Ok(result) => result,
+            Err(e) if should_recreate_without_passthrough(conpty.flags, &e) => {
+                conpty.close();
+                conpty = create_terminal_conpty(terminal_id, conpty_flags_without_passthrough())
+                    .with_context(|| err_context(&cmd))?;
+                match spawn_child_process(conpty.hpcon, &cmd, terminal_id) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        conpty.close();
+                        return Err(e).with_context(|| err_context(&cmd));
+                    },
                 }
+            },
+            Err(e) => {
+                conpty.close();
                 return Err(e).with_context(|| err_context(&cmd));
             },
         };
-
-        // 4. ConPTY duplicated the pipe ends it needs; close our copies.
-        unsafe {
-            CloseHandle(input_read);
-            CloseHandle(output_write);
-        }
-
-        // 5. Spawn child process
-        let (process_handle, thread_handle, child_pid, job_handle) =
-            match spawn_child_process(hpcon, &cmd, terminal_id) {
-                Ok(r) => r,
-                Err(e) => {
-                    unsafe {
-                        ClosePseudoConsole(hpcon);
-                        CloseHandle(input_write);
-                        CloseHandle(output_read);
-                    }
-                    return Err(e).with_context(|| err_context(&cmd));
-                },
-            };
 
         // Thread handle is not needed after spawn.
         unsafe { CloseHandle(thread_handle) };
@@ -876,8 +926,8 @@ impl WindowsPtyBackend {
         self.terminals.lock().unwrap().insert(
             terminal_id,
             Some(ConPtyTerminal {
-                hpcon,
-                input_write_handle: input_write,
+                hpcon: conpty.hpcon,
+                input_write_handle: conpty.input_write,
                 job_handle,
                 child_pid,
             }),
@@ -909,8 +959,10 @@ impl WindowsPtyBackend {
         });
 
         // 8. Wrap the output read handle in an async reader
-        let owned = unsafe { OwnedHandle::from_raw_handle(output_read as *mut core::ffi::c_void) };
-        let dsr_bootstrap = command_uses_powershell(&cmd).then_some(DsrBootstrap::new(input_write));
+        let owned =
+            unsafe { OwnedHandle::from_raw_handle(conpty.output_read as *mut core::ffi::c_void) };
+        let dsr_bootstrap =
+            command_uses_powershell(&cmd).then_some(DsrBootstrap::new(conpty.input_write));
         let reader = Box::new(ConPtyAsyncReader::new(owned, dsr_bootstrap)) as Box<dyn AsyncReader>;
 
         Ok((reader, child_pid))
