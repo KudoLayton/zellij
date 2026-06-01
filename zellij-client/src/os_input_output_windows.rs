@@ -7,6 +7,10 @@ use async_trait::async_trait;
 use std::io;
 use std::io::Write;
 use std::path::Path;
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Console::{
+    GetConsoleMode, GetStdHandle, WriteConsoleW, STD_OUTPUT_HANDLE,
+};
 use zellij_utils::ipc::{IpcReceiverWithContext, IpcSenderWithContext};
 
 /// Windows async signal listener.
@@ -246,6 +250,103 @@ pub(crate) fn disable_mouse_support(stdout: &mut dyn Write) -> Result<()> {
             .context(err_context)?;
     }
     Ok(())
+}
+
+pub(crate) fn stdout_writer() -> Box<dyn Write> {
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Box::new(std::io::stdout());
+    }
+    let mut mode = 0;
+    let is_console = unsafe { GetConsoleMode(handle, &mut mode) } != 0;
+    if is_console {
+        Box::new(WindowsConsoleWriter::new(handle))
+    } else {
+        Box::new(std::io::stdout())
+    }
+}
+
+struct WindowsConsoleWriter {
+    handle: HANDLE,
+    pending_utf8: Vec<u8>,
+}
+
+unsafe impl Send for WindowsConsoleWriter {}
+
+impl WindowsConsoleWriter {
+    fn new(handle: HANDLE) -> Self {
+        Self {
+            handle,
+            pending_utf8: Vec::new(),
+        }
+    }
+
+    fn write_utf16(&mut self, text: &str) -> io::Result<()> {
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        let mut offset = 0;
+        while offset < utf16.len() {
+            let chunk = &utf16[offset..];
+            let mut written = 0;
+            let ok = unsafe {
+                WriteConsoleW(
+                    self.handle,
+                    chunk.as_ptr().cast(),
+                    chunk.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            offset += written as usize;
+        }
+        Ok(())
+    }
+}
+
+impl Write for WindowsConsoleWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.pending_utf8.extend_from_slice(buf);
+        let pending = std::mem::take(&mut self.pending_utf8);
+        let split = split_valid_utf8_prefix(&pending);
+        if !split.valid.is_empty() {
+            let text = std::str::from_utf8(split.valid)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            self.write_utf16(text)?;
+        }
+        self.pending_utf8.extend_from_slice(split.pending);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct Utf8PrefixSplit<'a> {
+    valid: &'a [u8],
+    pending: &'a [u8],
+}
+
+fn split_valid_utf8_prefix(bytes: &[u8]) -> Utf8PrefixSplit<'_> {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => Utf8PrefixSplit {
+            valid: bytes,
+            pending: &[],
+        },
+        Err(e) if e.error_len().is_none() => {
+            let valid_up_to = e.valid_up_to();
+            Utf8PrefixSplit {
+                valid: &bytes[..valid_up_to],
+                pending: &bytes[valid_up_to..],
+            }
+        },
+        Err(_) => Utf8PrefixSplit {
+            valid: bytes,
+            pending: &[],
+        },
+    }
 }
 
 #[cfg(test)]
