@@ -2329,6 +2329,16 @@ fn update_new_saved_config(
     }
 }
 
+#[cfg(test)]
+mod detach_tests {
+    use super::*;
+
+    #[test]
+    fn normal_detach_uses_detached_exit_reason() {
+        assert_eq!(detach_exit_reason(), ExitReason::NormalDetached);
+    }
+}
+
 pub fn get_engine() -> Engine {
     log::info!("Loading plugins using Wasmi interpreter");
     Engine::default()
