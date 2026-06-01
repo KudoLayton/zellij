@@ -2,7 +2,7 @@ use crate::os_input_output::{resolve_command, AsyncReader};
 use crate::panes::PaneId;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env,
     ffi::OsStr,
     io,
@@ -57,6 +57,9 @@ const PASSTHROUGH_MIN_BUILD: u32 = 22_621;
 const DISABLE_PASSTHROUGH_ENV: &str = "ZELLIJ_CONPTY_NO_PASSTHROUGH";
 const E_HANDLE_HRESULT: i32 = 0x80070006_u32 as i32;
 const ERROR_BROKEN_PIPE_HRESULT: i32 = 0x8007006d_u32 as i32;
+const DSR_QUERY: &[u8] = b"\x1b[6n";
+const DSR_RESPONSE: &[u8] = b"\x1b[1;1R";
+const MAX_DSR_BOOTSTRAP_READS: usize = 8;
 
 /// Monotonic counter so each ConPTY output pipe gets a unique name, even when
 /// re-spawning on the same `terminal_id` (the old async reader may still hold
@@ -135,6 +138,8 @@ impl Drop for ConPtyTerminal {
 struct ConPtyAsyncReader {
     pending: Option<OwnedHandle>,
     pipe: Option<NamedPipeServer>,
+    dsr_bootstrap: Option<DsrBootstrap>,
+    buffered_output: VecDeque<u8>,
 }
 
 // OwnedHandle is Send+Sync; NamedPipeServer is Send.
@@ -143,17 +148,33 @@ struct ConPtyAsyncReader {
 unsafe impl Sync for ConPtyAsyncReader {}
 
 impl ConPtyAsyncReader {
-    fn new(handle: OwnedHandle) -> Self {
+    fn new(handle: OwnedHandle, dsr_bootstrap: Option<DsrBootstrap>) -> Self {
         Self {
             pending: Some(handle),
             pipe: None,
+            dsr_bootstrap,
+            buffered_output: VecDeque::new(),
         }
+    }
+
+    fn drain_buffered_output(&mut self, buf: &mut [u8]) -> Option<usize> {
+        if self.buffered_output.is_empty() {
+            return None;
+        }
+        let bytes_to_copy = buf.len().min(self.buffered_output.len());
+        for byte in buf.iter_mut().take(bytes_to_copy) {
+            *byte = self.buffered_output.pop_front().unwrap();
+        }
+        Some(bytes_to_copy)
     }
 }
 
 #[async_trait]
 impl AsyncReader for ConPtyAsyncReader {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
+        if let Some(bytes_read) = self.drain_buffered_output(buf) {
+            return Ok(bytes_read);
+        }
         if let Some(handle) = self.pending.take() {
             let pipe = unsafe { NamedPipeServer::from_raw_handle(handle.into_raw_handle()) }?;
             self.pipe = Some(pipe);
@@ -162,7 +183,69 @@ impl AsyncReader for ConPtyAsyncReader {
             .pipe
             .as_mut()
             .expect("ConPtyAsyncReader used after init");
-        pipe.read(buf).await
+        loop {
+            let bytes_read = pipe.read(buf).await?;
+            if bytes_read == 0 {
+                return Ok(0);
+            }
+            if let Some(dsr_bootstrap) = self.dsr_bootstrap.as_mut() {
+                let filtered = dsr_bootstrap.filter(&buf[..bytes_read]);
+                if dsr_bootstrap.is_done() {
+                    self.dsr_bootstrap = None;
+                }
+                if filtered.is_empty() {
+                    continue;
+                }
+                let bytes_to_copy = filtered.len().min(buf.len());
+                buf[..bytes_to_copy].copy_from_slice(&filtered[..bytes_to_copy]);
+                self.buffered_output
+                    .extend(filtered[bytes_to_copy..].iter().copied());
+                return Ok(bytes_to_copy);
+            }
+            return Ok(bytes_read);
+        }
+    }
+}
+
+struct DsrBootstrap {
+    input_write_handle: HANDLE,
+    reads_remaining: usize,
+    answered: bool,
+}
+
+unsafe impl Send for DsrBootstrap {}
+unsafe impl Sync for DsrBootstrap {}
+
+impl DsrBootstrap {
+    fn new(input_write_handle: HANDLE) -> Self {
+        Self {
+            input_write_handle,
+            reads_remaining: MAX_DSR_BOOTSTRAP_READS,
+            answered: false,
+        }
+    }
+
+    fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.reads_remaining = self.reads_remaining.saturating_sub(1);
+        let (filtered, found_dsr) = strip_dsr_query_once(bytes);
+        if found_dsr && !self.answered {
+            self.answered = true;
+            let mut written = 0;
+            unsafe {
+                WriteFile(
+                    self.input_write_handle,
+                    DSR_RESPONSE.as_ptr(),
+                    DSR_RESPONSE.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+        filtered
+    }
+
+    fn is_done(&self) -> bool {
+        self.answered || self.reads_remaining == 0
     }
 }
 
@@ -241,6 +324,31 @@ fn build_environment_block(terminal_id: u32) -> Vec<u16> {
     block.push(0);
     block.push(0); // double-null terminator
     block
+}
+
+fn strip_dsr_query_once(bytes: &[u8]) -> (Vec<u8>, bool) {
+    if let Some(index) = bytes
+        .windows(DSR_QUERY.len())
+        .position(|window| window == DSR_QUERY)
+    {
+        let mut filtered = Vec::with_capacity(bytes.len() - DSR_QUERY.len());
+        filtered.extend_from_slice(&bytes[..index]);
+        filtered.extend_from_slice(&bytes[index + DSR_QUERY.len()..]);
+        (filtered, true)
+    } else {
+        (bytes.to_vec(), false)
+    }
+}
+
+fn command_uses_powershell(cmd: &RunCommand) -> bool {
+    cmd.command
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let name = name.to_ascii_lowercase();
+            name == "pwsh" || name == "powershell"
+        })
+        .unwrap_or(false)
 }
 
 fn child_process_creation_flags(breakaway_from_job: bool) -> u32 {
@@ -698,7 +806,8 @@ impl WindowsPtyBackend {
 
         // 8. Wrap the output read handle in an async reader
         let owned = unsafe { OwnedHandle::from_raw_handle(output_read as *mut core::ffi::c_void) };
-        let reader = Box::new(ConPtyAsyncReader::new(owned)) as Box<dyn AsyncReader>;
+        let dsr_bootstrap = command_uses_powershell(&cmd).then_some(DsrBootstrap::new(input_write));
+        let reader = Box::new(ConPtyAsyncReader::new(owned, dsr_bootstrap)) as Box<dyn AsyncReader>;
 
         Ok((reader, child_pid))
     }
