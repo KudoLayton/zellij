@@ -60,6 +60,7 @@ const MAX_DSR_BOOTSTRAP_TIMEOUT_MS: u64 = 2_000;
 const DSR_BOOTSTRAP_TIMEOUT_ENV: &str = "ZELLIJ_DSR_BOOTSTRAP_TIMEOUT_MS";
 
 const CONPTY_READ_BUFFER_SIZE: usize = 65536;
+const CONPTY_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 
 /// Per-terminal ConPTY state.
 struct ConPtyTerminal {
@@ -130,7 +131,7 @@ impl Drop for ConPtyTerminal {
 }
 
 struct ConPtyBlockingReader {
-    output_rx: UnboundedReceiver<io::Result<Vec<u8>>>,
+    output_rx: Receiver<io::Result<Vec<u8>>>,
     buffered_output: VecDeque<u8>,
 }
 
@@ -141,7 +142,7 @@ impl ConPtyBlockingReader {
         Self::from_receiver(spawn_blocking_conpty_reader(handle, dsr_bootstrap))
     }
 
-    fn from_receiver(output_rx: UnboundedReceiver<io::Result<Vec<u8>>>) -> Self {
+    fn from_receiver(output_rx: Receiver<io::Result<Vec<u8>>>) -> Self {
         Self {
             output_rx,
             buffered_output: VecDeque::new(),
@@ -184,8 +185,8 @@ impl AsyncReader for ConPtyBlockingReader {
 fn spawn_blocking_conpty_reader(
     handle: OwnedHandle,
     mut dsr_bootstrap: Option<DsrBootstrap>,
-) -> UnboundedReceiver<io::Result<Vec<u8>>> {
-    let (tx, rx) = mpsc::unbounded_channel();
+) -> Receiver<io::Result<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel(CONPTY_OUTPUT_CHANNEL_CAPACITY);
     std::thread::Builder::new()
         .name("zellij-conpty-reader".to_owned())
         .spawn(move || {
@@ -196,7 +197,7 @@ fn spawn_blocking_conpty_reader(
                         if dsr.is_done() {
                             dsr_bootstrap = None;
                         }
-                        if !bytes.is_empty() && tx.send(Ok(bytes)).is_err() {
+                        if !bytes.is_empty() && tx.blocking_send(Ok(bytes)).is_err() {
                             break;
                         }
                         continue;
@@ -216,12 +217,12 @@ fn spawn_blocking_conpty_reader(
                                 continue;
                             }
                         }
-                        if tx.send(Ok(bytes)).is_err() {
+                        if tx.blocking_send(Ok(bytes)).is_err() {
                             break;
                         }
                     },
                     Err(error) => {
-                        let _ = tx.send(Err(error));
+                        let _ = tx.blocking_send(Err(error));
                         break;
                     },
                 }
@@ -1343,8 +1344,8 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_reader_buffers_chunk_tail() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(Ok(b"abcdef".to_vec())).expect("send chunk");
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Ok(b"abcdef".to_vec())).await.expect("send chunk");
         drop(tx);
         let mut reader = ConPtyBlockingReader::from_receiver(rx);
         let mut buf = [0_u8; 2];
@@ -1360,8 +1361,9 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_reader_propagates_read_error() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1);
         tx.send(Err(io::Error::from_raw_os_error(5)))
+            .await
             .expect("send error");
         let mut reader = ConPtyBlockingReader::from_receiver(rx);
         let mut buf = [0_u8; 8];
@@ -1369,6 +1371,18 @@ mod tests {
         let error = reader.read(&mut buf).await.expect_err("read error");
 
         assert_eq!(error.raw_os_error(), Some(5));
+    }
+
+    #[test]
+    fn conpty_output_channel_is_bounded() {
+        let (tx, _rx) = mpsc::channel::<io::Result<Vec<u8>>>(1);
+
+        tx.try_send(Ok(b"first".to_vec())).expect("first send fits");
+
+        assert!(
+            tx.try_send(Ok(b"second".to_vec())).is_err(),
+            "bounded ConPTY output channel should apply backpressure when full"
+        );
     }
 
     #[tokio::test]
@@ -1687,4 +1701,4 @@ mod tests {
         }
     }
 }
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::{self, Receiver};
