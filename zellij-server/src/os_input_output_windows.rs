@@ -554,8 +554,14 @@ fn current_windows_build() -> io::Result<u32> {
 fn create_anonymous_pipe() -> io::Result<(HANDLE, HANDLE)> {
     let mut read: HANDLE = std::ptr::null_mut();
     let mut write: HANDLE = std::ptr::null_mut();
-    if unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), CONPTY_READ_BUFFER_SIZE as u32) }
-        == 0
+    if unsafe {
+        CreatePipe(
+            &mut read,
+            &mut write,
+            std::ptr::null(),
+            CONPTY_READ_BUFFER_SIZE as u32,
+        )
+    } == 0
     {
         Err(io::Error::last_os_error())
     } else {
@@ -1395,8 +1401,11 @@ mod tests {
                 "timed out waiting for ConPTY output: {}",
                 String::from_utf8_lossy(&output)
             );
-            match tokio::time::timeout(remaining.min(Duration::from_millis(500)), reader.read(&mut buf))
-                .await
+            match tokio::time::timeout(
+                remaining.min(Duration::from_millis(500)),
+                reader.read(&mut buf),
+            )
+            .await
             {
                 Ok(Ok(0)) => break,
                 Ok(Ok(bytes_read)) => {
