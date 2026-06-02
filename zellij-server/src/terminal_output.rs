@@ -346,6 +346,51 @@ mod tests {
     }
 
     #[test]
+    fn generation_switch_clears_recent_bytes_used_for_gap_recovery() {
+        let mut store = TerminalOutputStore::with_limits(2, 64);
+        store.push(&output(1, 1, 0, b"old-generation"));
+        store.push(&output(1, 2, 0, b"fresh-zero"));
+        let mut cursor = store.cursor_from_oldest(1);
+        store.push(&output(1, 2, 1, b"fresh-one"));
+        store.push(&output(1, 2, 2, b"fresh-two"));
+
+        assert_eq!(
+            store.poll_cursor(1, &mut cursor),
+            Some(TerminalOutputCursorItem::Gap(TerminalOutputGap {
+                expected_sequence: 0,
+                resume_sequence: 1,
+                skipped_events: 1,
+                newest_sequence: 2,
+                recent_bytes: b"fresh-zerofresh-onefresh-two".to_vec(),
+            }))
+        );
+    }
+
+    #[test]
+    fn replayed_sequence_is_not_retained_or_reported_as_gap() {
+        let mut store = TerminalOutputStore::with_limits(4, 64);
+        store.push(&output(1, 1, 0, b"first"));
+        let mut cursor = store.cursor_from_oldest(1);
+
+        assert_eq!(store.push(&output(1, 1, 0, b"replay")), None);
+        store.push(&output(1, 1, 1, b"second"));
+
+        assert_eq!(
+            store.drain_cursor(1, &mut cursor, 8),
+            vec![
+                TerminalOutputCursorItem::Event(TerminalOutputEvent {
+                    sequence: 0,
+                    bytes: b"first".to_vec(),
+                }),
+                TerminalOutputCursorItem::Event(TerminalOutputEvent {
+                    sequence: 1,
+                    bytes: b"second".to_vec(),
+                }),
+            ]
+        );
+    }
+
+    #[test]
     fn unguarded_output_is_not_retained() {
         let mut store = TerminalOutputStore::with_limits(4, 64);
         assert_eq!(
