@@ -703,6 +703,7 @@ pub fn start_remote_client(
     envs::set_zellij("0".to_string());
 
     let full_screen_ws = os_input.get_terminal_size();
+    let terminal_cleanup = TerminalCleanupGuard::new();
 
     os_input.set_raw_mode();
     stdout.write_all(ENABLE_BRACKETED_PASTE.as_bytes()).unwrap();
@@ -710,23 +711,20 @@ pub fn start_remote_client(
     std::panic::set_hook({
         use zellij_utils::errors::handle_panic;
         let os_input = os_input.clone();
+        let terminal_cleanup = terminal_cleanup.clone();
         Box::new(move |info| {
-            os_input.disable_mouse().non_fatal();
-            os_input.restore_console_mode();
-            if let Ok(()) = os_input.unset_raw_mode() {
-                handle_panic::<ClientInstruction>(info, None);
+            if terminal_cleanup.mark_started() {
+                os_input.disable_mouse().non_fatal();
+                os_input.restore_console_mode();
+                if let Ok(()) = os_input.unset_raw_mode() {
+                    handle_panic::<ClientInstruction>(info, None);
+                }
             }
         })
     });
 
     let reset_controlling_terminal_state = |e: String, exit_status: i32| {
-        os_input.disable_mouse().non_fatal();
-        os_input.unset_raw_mode().unwrap();
-        os_input.restore_console_mode();
-        let error = terminal_teardown_message(&e, full_screen_ws.rows, true);
-        let mut stdout = os_input.get_stdout_writer();
-        stdout.write_all(error.as_bytes()).unwrap();
-        stdout.flush().unwrap();
+        terminal_cleanup.run(&*os_input, &e, full_screen_ws.rows, true);
         if exit_status == 0 {
             log::info!("{}", e);
         } else {
