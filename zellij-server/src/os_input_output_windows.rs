@@ -1205,6 +1205,8 @@ impl WindowsPtyBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Foundation::STILL_ACTIVE;
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
 
     #[test]
     fn conpty_flags_include_resize_and_win32_input_by_default() {
@@ -1432,6 +1434,257 @@ mod tests {
             "expected marker in ConPTY output, got: {}",
             String::from_utf8_lossy(&output)
         );
+    }
+
+    #[tokio::test]
+    async fn real_conpty_interactive_cmd_accepts_written_input() {
+        let marker = "ZELLIJ_INTERACTIVE_CONPTY_OK";
+        let cmd = RunCommand {
+            command: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            args: vec!["/D".to_owned(), "/K".to_owned()],
+            ..Default::default()
+        };
+        let (conpty, process_handle, thread_handle, job_handle, mut reader) =
+            spawn_test_conpty(&cmd);
+        unsafe { CloseHandle(thread_handle) };
+
+        write_to_conpty(conpty.input_write, format!("echo {marker}\r\n").as_bytes());
+        let output = read_until_marker(&mut reader, marker, Duration::from_secs(5)).await;
+
+        terminate_job(job_handle).expect("terminate job");
+        unsafe {
+            WaitForSingleObject(process_handle, INFINITE);
+            ClosePseudoConsole(conpty.hpcon);
+            CloseHandle(process_handle);
+            CloseHandle(conpty.input_write);
+            CloseHandle(job_handle);
+        }
+
+        assert!(
+            String::from_utf8_lossy(&output).contains(marker),
+            "expected interactive marker in ConPTY output, got: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[tokio::test]
+    async fn real_conpty_resize_after_child_exit_is_not_fatal() {
+        let cmd = RunCommand {
+            command: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            args: vec!["/D".to_owned(), "/C".to_owned(), "exit 0".to_owned()],
+            ..Default::default()
+        };
+        let (conpty, process_handle, thread_handle, job_handle, reader) = spawn_test_conpty(&cmd);
+        unsafe {
+            CloseHandle(thread_handle);
+            WaitForSingleObject(process_handle, INFINITE);
+        }
+
+        let resize_result = unsafe { ResizePseudoConsole(conpty.hpcon, COORD { X: 90, Y: 25 }) };
+
+        drop(reader);
+        unsafe {
+            ClosePseudoConsole(conpty.hpcon);
+            CloseHandle(process_handle);
+            CloseHandle(conpty.input_write);
+            CloseHandle(job_handle);
+        }
+        assert!(
+            resize_result == S_OK || is_benign_resize_after_exit_hresult(resize_result),
+            "ResizePseudoConsole after child exit returned HRESULT 0x{:08x}",
+            resize_result as u32
+        );
+    }
+
+    #[tokio::test]
+    async fn real_conpty_force_kill_reaps_child() {
+        let cmd = RunCommand {
+            command: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            args: vec![
+                "/D".to_owned(),
+                "/C".to_owned(),
+                "ping -n 30 127.0.0.1 >NUL".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let (conpty, process_handle, thread_handle, job_handle, reader) = spawn_test_conpty(&cmd);
+        unsafe { CloseHandle(thread_handle) };
+
+        terminate_job(job_handle).expect("terminate job");
+        unsafe { WaitForSingleObject(process_handle, INFINITE) };
+
+        let mut exit_code = STILL_ACTIVE as u32;
+        let exit_code_ok = unsafe { GetExitCodeProcess(process_handle, &mut exit_code) };
+
+        drop(reader);
+        unsafe {
+            ClosePseudoConsole(conpty.hpcon);
+            CloseHandle(process_handle);
+            CloseHandle(conpty.input_write);
+            CloseHandle(job_handle);
+        }
+        assert_ne!(exit_code_ok, 0, "GetExitCodeProcess failed");
+        assert_ne!(
+            exit_code, STILL_ACTIVE as u32,
+            "child process survived Job Object kill"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_conpty_force_kill_reaps_grandchild_process_tree() {
+        let marker = "ZELLIJ_GRANDCHILD=";
+        let command = concat!(
+            "$child = Start-Process -FilePath powershell.exe ",
+            "-ArgumentList '-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 30' ",
+            "-WindowStyle Hidden -PassThru; ",
+            "Write-Output \"ZELLIJ_GRANDCHILD=$($child.Id)\"; ",
+            "Start-Sleep -Seconds 30"
+        );
+        let cmd = RunCommand {
+            command: std::path::PathBuf::from(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            ),
+            args: vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-ExecutionPolicy".to_owned(),
+                "Bypass".to_owned(),
+                "-Command".to_owned(),
+                command.to_owned(),
+            ],
+            ..Default::default()
+        };
+        let (conpty, process_handle, thread_handle, job_handle, mut reader) =
+            spawn_test_conpty(&cmd);
+        unsafe { CloseHandle(thread_handle) };
+        let output = read_until_marker(&mut reader, marker, Duration::from_secs(5)).await;
+        let grandchild_pid = parse_marker_pid(&output, marker).expect("grandchild pid");
+        assert!(
+            process_is_running(grandchild_pid),
+            "grandchild should be running before force kill"
+        );
+
+        terminate_job(job_handle).expect("terminate job");
+        unsafe { WaitForSingleObject(process_handle, INFINITE) };
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_is_running(grandchild_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let survived = process_is_running(grandchild_pid);
+        if survived {
+            terminate_process_id(grandchild_pid);
+        }
+
+        drop(reader);
+        unsafe {
+            ClosePseudoConsole(conpty.hpcon);
+            CloseHandle(process_handle);
+            CloseHandle(conpty.input_write);
+            CloseHandle(job_handle);
+        }
+        assert!(
+            !survived,
+            "grandchild process {grandchild_pid} survived Job Object kill"
+        );
+    }
+
+    fn spawn_test_conpty(
+        cmd: &RunCommand,
+    ) -> (
+        ConPtySpawnState,
+        HANDLE,
+        HANDLE,
+        HANDLE,
+        ConPtyBlockingReader,
+    ) {
+        let conpty =
+            create_terminal_conpty(10_002, conpty_flags_without_passthrough()).expect("ConPTY");
+        let (process_handle, thread_handle, _child_pid, job_handle) =
+            spawn_child_process(conpty.hpcon, cmd, 10_002).expect("spawn child");
+        let output_read =
+            unsafe { OwnedHandle::from_raw_handle(conpty.output_read as *mut core::ffi::c_void) };
+        let reader = ConPtyBlockingReader::new(output_read, None);
+        (conpty, process_handle, thread_handle, job_handle, reader)
+    }
+
+    fn write_to_conpty(input_write: HANDLE, bytes: &[u8]) {
+        let mut written = 0;
+        let ok = unsafe {
+            WriteFile(
+                input_write,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "failed to write to ConPTY input");
+    }
+
+    async fn read_until_marker(
+        reader: &mut ConPtyBlockingReader,
+        marker: &str,
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut buf = [0_u8; 1024];
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for ConPTY marker {marker}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            match tokio::time::timeout(
+                remaining.min(Duration::from_millis(500)),
+                reader.read(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(0)) => return output,
+                Ok(Ok(bytes_read)) => {
+                    output.extend_from_slice(&buf[..bytes_read]);
+                    if String::from_utf8_lossy(&output).contains(marker) {
+                        return output;
+                    }
+                },
+                Ok(Err(error)) => panic!("ConPTY read failed: {error}"),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn parse_marker_pid(bytes: &[u8], marker: &str) -> Option<u32> {
+        let output = String::from_utf8_lossy(bytes);
+        let start = output.find(marker)? + marker.len();
+        let digits = output[start..]
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>();
+        digits.parse().ok()
+    }
+
+    fn process_is_running(pid: u32) -> bool {
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process == std::ptr::null_mut() {
+            return false;
+        }
+        let mut exit_code = 0;
+        let ok = unsafe { GetExitCodeProcess(process, &mut exit_code) };
+        unsafe { CloseHandle(process) };
+        ok != 0 && exit_code == STILL_ACTIVE as u32
+    }
+
+    fn terminate_process_id(pid: u32) {
+        let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if process != std::ptr::null_mut() {
+            unsafe {
+                TerminateProcess(process, 1);
+                CloseHandle(process);
+            }
+        }
     }
 }
 use tokio::sync::mpsc::{self, UnboundedReceiver};
