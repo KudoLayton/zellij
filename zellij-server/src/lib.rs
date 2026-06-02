@@ -648,6 +648,18 @@ impl SessionState {
     pub fn client_is_connected(&self, client_id: ClientId) -> bool {
         self.clients.contains_key(&client_id) || self.watchers.contains_key(&client_id)
     }
+    pub fn connected_render_targets<'a>(
+        &self,
+        output: &'a HashMap<ClientId, String>,
+    ) -> Vec<(ClientId, &'a String)> {
+        output
+            .iter()
+            .filter_map(|(client_id, render_instruction)| {
+                self.client_is_connected(*client_id)
+                    .then_some((*client_id, render_instruction))
+            })
+            .collect()
+    }
     pub fn web_client_ids(&self) -> Vec<ClientId> {
         self.clients
             .iter()
@@ -781,6 +793,38 @@ mod session_state_tests {
 
         assert!(!s.client_is_connected(1));
         assert!(!s.client_is_connected(2));
+    }
+
+    #[test]
+    fn connected_render_targets_excludes_removed_clients_and_watchers() {
+        let mut s = SessionState::new();
+        s.clients.insert(1, None);
+        s.watchers.insert(2, false);
+        s.clients.insert(3, None);
+        s.watchers.insert(4, false);
+        s.remove_client(1);
+        s.remove_watcher(2);
+
+        let output = HashMap::from([
+            (1, "removed-client".to_owned()),
+            (2, "removed-watcher".to_owned()),
+            (3, "connected-client".to_owned()),
+            (4, "connected-watcher".to_owned()),
+        ]);
+        let mut connected = s
+            .connected_render_targets(&output)
+            .into_iter()
+            .map(|(client_id, render)| (client_id, render.clone()))
+            .collect::<Vec<_>>();
+        connected.sort_by_key(|(client_id, _)| *client_id);
+
+        assert_eq!(
+            connected,
+            vec![
+                (3, "connected-client".to_owned()),
+                (4, "connected-watcher".to_owned())
+            ]
+        );
     }
 
     #[test]
@@ -1456,16 +1500,13 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                 // If `Some(_)`- unwrap it and forward it to the clients to render.
                 // If `None`- Send an exit instruction. This is the case when a user closes the last Tab/Pane.
                 if let Some(output) = &serialized_output {
-                    for (client_id, client_render_instruction) in output.iter() {
-                        if !session_state
-                            .read()
-                            .unwrap()
-                            .client_is_connected(*client_id)
-                        {
-                            continue;
-                        }
+                    let connected_render_targets = session_state
+                        .read()
+                        .unwrap()
+                        .connected_render_targets(output);
+                    for (client_id, client_render_instruction) in connected_render_targets {
                         send_to_client!(
-                            *client_id,
+                            client_id,
                             os_input,
                             ServerToClientMsg::Render {
                                 content: client_render_instruction.clone()
