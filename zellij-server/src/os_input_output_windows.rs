@@ -1373,6 +1373,25 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(5));
     }
 
+    #[tokio::test]
+    async fn blocking_reader_drains_buffered_tail_before_next_channel_item() {
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Ok(b"abcdef".to_vec())).await.expect("send chunk");
+        tx.send(Err(io::Error::from_raw_os_error(5)))
+            .await
+            .expect("send error");
+        let mut reader = ConPtyBlockingReader::from_receiver(rx);
+        let mut buf = [0_u8; 3];
+
+        assert_eq!(reader.read(&mut buf).await.expect("first read"), 3);
+        assert_eq!(&buf, b"abc");
+        assert_eq!(reader.read(&mut buf).await.expect("tail read"), 3);
+        assert_eq!(&buf, b"def");
+
+        let error = reader.read(&mut buf).await.expect_err("queued error");
+        assert_eq!(error.raw_os_error(), Some(5));
+    }
+
     #[test]
     fn conpty_output_channel_is_bounded() {
         let (tx, _rx) = mpsc::channel::<io::Result<Vec<u8>>>(1);
