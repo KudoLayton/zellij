@@ -3,7 +3,7 @@ use crate::background_jobs::BackgroundJob;
 use crate::global_async_runtime::get_tokio_runtime as async_runtime;
 use crate::os_input_output::{AsyncReader, NullAsyncReader};
 use crate::route::NotificationEnd;
-use crate::terminal_bytes::TerminalBytes;
+use crate::terminal_bytes::{TerminalBytes, TerminalStreamGuard};
 use crate::{
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction},
@@ -12,7 +12,7 @@ use crate::{
     thread_bus::{Bus, ThreadSenders},
     ClientId, ServerInstruction,
 };
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, Arc};
 use std::{collections::HashMap, path::PathBuf};
 use tokio::task::JoinHandle;
 use zellij_utils::{
@@ -205,6 +205,7 @@ pub(crate) struct Pty {
     plugin_cwds: HashMap<u32, PathBuf>,   // plugin_id -> cwd
     terminal_cwds: HashMap<u32, PathBuf>, // terminal_id -> cwd
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    terminal_read_generations: HashMap<u32, Arc<AtomicU64>>,
     terminal_cmds: HashMap<u32, Vec<String>>,
     terminal_foreground_cmds: HashMap<u32, Vec<String>>,
 }
@@ -923,6 +924,7 @@ impl Pty {
             plugin_cwds: HashMap::new(),
             terminal_cwds: HashMap::new(),
             pane_activity_flags: HashMap::new(),
+            terminal_read_generations: HashMap::new(),
             terminal_cmds: HashMap::new(),
             terminal_foreground_cmds: HashMap::new(),
         }
@@ -1015,6 +1017,22 @@ impl Pty {
             };
         };
     }
+
+    fn next_terminal_stream_guard(&mut self, terminal_id: u32) -> TerminalStreamGuard {
+        let generation = self
+            .terminal_read_generations
+            .entry(terminal_id)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        TerminalStreamGuard::next(generation)
+    }
+
+    fn invalidate_terminal_stream(&mut self, terminal_id: u32) {
+        if let Some(generation) = self.terminal_read_generations.get(&terminal_id) {
+            TerminalStreamGuard::new(Arc::clone(generation)).invalidate();
+        }
+    }
+
     pub fn spawn_terminal(
         &mut self,
         terminal_action: Option<TerminalAction>,
@@ -1130,6 +1148,7 @@ impl Pty {
             })
             .with_context(err_context)?;
         let activity_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream_guard = self.next_terminal_stream_guard(terminal_id);
         let terminal_bytes = async_runtime().spawn({
             let err_context =
                 |terminal_id: u32| format!("failed to run async task for terminal {terminal_id}");
@@ -1137,11 +1156,18 @@ impl Pty {
             let debug_to_file = self.debug_to_file;
             let activity_flag = activity_flag.clone();
             async move {
-                TerminalBytes::new(terminal_id, reader, senders, debug_to_file, activity_flag)
-                    .listen()
-                    .await
-                    .with_context(|| err_context(terminal_id))
-                    .fatal();
+                TerminalBytes::new_with_stream_guard(
+                    terminal_id,
+                    reader,
+                    senders,
+                    debug_to_file,
+                    activity_flag,
+                    stream_guard,
+                )
+                .listen()
+                .await
+                .with_context(|| err_context(terminal_id))
+                .fatal();
             }
         });
 
@@ -1334,17 +1360,19 @@ impl Pty {
                 Ok(reader) => {
                     let activity_flag =
                         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let stream_guard = self.next_terminal_stream_guard(terminal_id);
                     let terminal_bytes = async_runtime().spawn({
                         let senders = self.bus.senders.clone();
                         let debug_to_file = self.debug_to_file;
                         let activity_flag = activity_flag.clone();
                         async move {
-                            TerminalBytes::new(
+                            TerminalBytes::new_with_stream_guard(
                                 terminal_id,
                                 reader,
                                 senders,
                                 debug_to_file,
                                 activity_flag,
+                                stream_guard,
                             )
                             .listen()
                             .await
@@ -1512,17 +1540,19 @@ impl Pty {
                 Ok(reader) => {
                     let activity_flag =
                         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let stream_guard = self.next_terminal_stream_guard(terminal_id);
                     let terminal_bytes = async_runtime().spawn({
                         let senders = self.bus.senders.clone();
                         let debug_to_file = self.debug_to_file;
                         let activity_flag = activity_flag.clone();
                         async move {
-                            TerminalBytes::new(
+                            TerminalBytes::new_with_stream_guard(
                                 terminal_id,
                                 reader,
                                 senders,
                                 debug_to_file,
                                 activity_flag,
+                                stream_guard,
                             )
                             .listen()
                             .await
@@ -1799,6 +1829,7 @@ impl Pty {
         let err_context = || format!("failed to close for pane {id:?}");
         match id {
             PaneId::Terminal(id) => {
+                self.invalidate_terminal_stream(id);
                 if let Some(handle) = self.task_handles.remove(&id) {
                     handle.abort();
                 }
@@ -1814,6 +1845,7 @@ impl Pty {
                         .non_fatal();
                 }
                 self.pane_activity_flags.remove(&id);
+                self.terminal_read_generations.remove(&id);
                 self.terminal_cwds.remove(&id);
                 self.terminal_cmds.remove(&id);
                 self.terminal_foreground_cmds.remove(&id);
@@ -1856,6 +1888,7 @@ impl Pty {
                 if let Some(originating_plugins) = self.originating_plugins.get(&id) {
                     run_command.originating_plugin = Some(originating_plugins.clone());
                 }
+                self.invalidate_terminal_stream(id);
                 let _ = self.task_handles.remove(&id); // if all is well, this shouldn't be here
                 let _ = self.id_to_child_pid.remove(&id); // if all is wlel, this shouldn't be here
 
@@ -1904,6 +1937,7 @@ impl Pty {
                     })
                     .with_context(err_context)?;
                 let activity_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stream_guard = self.next_terminal_stream_guard(id);
                 let terminal_bytes = async_runtime().spawn({
                     let err_context =
                         |pane_id| format!("failed to run async task for pane {pane_id:?}");
@@ -1911,11 +1945,18 @@ impl Pty {
                     let debug_to_file = self.debug_to_file;
                     let activity_flag = activity_flag.clone();
                     async move {
-                        TerminalBytes::new(id, reader, senders, debug_to_file, activity_flag)
-                            .listen()
-                            .await
-                            .with_context(|| err_context(pane_id))
-                            .fatal();
+                        TerminalBytes::new_with_stream_guard(
+                            id,
+                            reader,
+                            senders,
+                            debug_to_file,
+                            activity_flag,
+                            stream_guard,
+                        )
+                        .listen()
+                        .await
+                        .with_context(|| err_context(pane_id))
+                        .fatal();
                     }
                 });
 

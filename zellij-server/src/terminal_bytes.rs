@@ -1,6 +1,6 @@
 use crate::{os_input_output::AsyncReader, screen::ScreenInstruction, thread_bus::ThreadSenders};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -16,15 +16,49 @@ pub(crate) struct TerminalBytes {
     async_reader: Box<dyn AsyncReader>,
     debug: bool,
     activity_flag: Arc<AtomicBool>,
+    stream_guard: TerminalStreamGuard,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalStreamGuard {
+    current_generation: Arc<AtomicU64>,
+    generation: u64,
+}
+
+impl TerminalStreamGuard {
+    pub(crate) fn new(current_generation: Arc<AtomicU64>) -> Self {
+        let generation = current_generation.load(Ordering::Relaxed);
+        Self {
+            current_generation,
+            generation,
+        }
+    }
+
+    pub(crate) fn next(current_generation: Arc<AtomicU64>) -> Self {
+        let generation = current_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        Self {
+            current_generation,
+            generation,
+        }
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.current_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn is_current(&self) -> bool {
+        self.current_generation.load(Ordering::Acquire) == self.generation
+    }
 }
 
 impl TerminalBytes {
-    pub fn new(
+    pub fn new_with_stream_guard(
         terminal_id: u32,
         async_reader: Box<dyn AsyncReader>,
         senders: ThreadSenders,
         debug: bool,
         activity_flag: Arc<AtomicBool>,
+        stream_guard: TerminalStreamGuard,
     ) -> Self {
         TerminalBytes {
             terminal_id,
@@ -32,8 +66,10 @@ impl TerminalBytes {
             debug,
             async_reader,
             activity_flag,
+            stream_guard,
         }
     }
+
     pub async fn listen(&mut self) -> Result<()> {
         // This function reads bytes from the pty and then sends them as
         // ScreenInstruction::PtyBytes to screen to be parsed there
@@ -59,6 +95,9 @@ impl TerminalBytes {
                     break;
                 },
                 Ok(n_bytes) => {
+                    if !self.stream_guard.is_current() {
+                        break;
+                    }
                     self.activity_flag.store(true, Ordering::Relaxed);
                     let bytes = &buf[..n_bytes];
                     if self.debug {
@@ -88,7 +127,9 @@ impl TerminalBytes {
         //
         // FIXME: Ideally we detect whether the application is being quit and only ignore the error
         // in that particular case?
-        let _ = self.async_send_to_screen(ScreenInstruction::Render).await;
+        if self.stream_guard.is_current() {
+            let _ = self.async_send_to_screen(ScreenInstruction::Render).await;
+        }
 
         Ok(())
     }
@@ -104,5 +145,24 @@ impl TerminalBytes {
             .context("failed to async-send to screen")?
             .context("failed to block on sending message to screen")?;
         Ok(sent_at.elapsed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_stream_guard_rejects_stale_generation() {
+        let current_generation = Arc::new(AtomicU64::new(0));
+        let old_guard = TerminalStreamGuard::new(Arc::clone(&current_generation));
+        let fresh_guard = TerminalStreamGuard::next(Arc::clone(&current_generation));
+
+        assert!(!old_guard.is_current());
+        assert!(fresh_guard.is_current());
+
+        fresh_guard.invalidate();
+
+        assert!(!fresh_guard.is_current());
     }
 }
