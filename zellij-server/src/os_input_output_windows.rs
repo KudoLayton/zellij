@@ -9,23 +9,20 @@ use std::{
     mem::size_of,
     ops::BitOr,
     os::windows::ffi::OsStrExt,
-    os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle},
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, Ordering},
+        mpsc::{self, Receiver},
         Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 
-use tokio::io::AsyncReadExt;
-use tokio::net::windows::named_pipe::NamedPipeServer;
-
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, INVALID_HANDLE_VALUE, S_OK,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_INVALID_PARAMETER, ERROR_NO_DATA, HANDLE,
+    INVALID_HANDLE_VALUE, S_OK,
 };
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-};
+use windows_sys::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, GenerateConsoleCtrlEvent, ResizePseudoConsole, COORD,
     CTRL_C_EVENT, HPCON,
@@ -35,7 +32,7 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, CreatePipe};
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOEXW;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
@@ -51,11 +48,6 @@ pub use async_trait::async_trait;
 
 // Not exported by windows-sys; value from the Windows SDK.
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x00020016;
-const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x00080000;
-const PIPE_ACCESS_INBOUND: u32 = 0x00000001;
-const PIPE_TYPE_BYTE: u32 = 0;
-const PIPE_WAIT: u32 = 0;
-const GENERIC_WRITE: u32 = 0x40000000;
 const PASSTHROUGH_MIN_BUILD: u32 = 22_621;
 const DISABLE_PASSTHROUGH_ENV: &str = "ZELLIJ_CONPTY_NO_PASSTHROUGH";
 const E_HANDLE_HRESULT: i32 = 0x80070006_u32 as i32;
@@ -68,10 +60,7 @@ const MIN_DSR_BOOTSTRAP_TIMEOUT_MS: u64 = 50;
 const MAX_DSR_BOOTSTRAP_TIMEOUT_MS: u64 = 2_000;
 const DSR_BOOTSTRAP_TIMEOUT_ENV: &str = "ZELLIJ_DSR_BOOTSTRAP_TIMEOUT_MS";
 
-/// Monotonic counter so each ConPTY output pipe gets a unique name, even when
-/// re-spawning on the same `terminal_id` (the old async reader may still hold
-/// the previous pipe handle).
-static PIPE_SEQ: AtomicU64 = AtomicU64::new(0);
+const CONPTY_READ_BUFFER_SIZE: usize = 65536;
 
 /// Per-terminal ConPTY state.
 struct ConPtyTerminal {
@@ -141,29 +130,21 @@ impl Drop for ConPtyTerminal {
     }
 }
 
-/// An `AsyncReader` backed by a named pipe connected to ConPTY output.
-///
-/// Construction stores the raw `OwnedHandle`. The first `read()` call promotes
-/// it to a `NamedPipeServer` (IOCP registration requires a live Tokio reactor,
-/// which is not available at `spawn_terminal` time).
-struct ConPtyAsyncReader {
-    pending: Option<OwnedHandle>,
-    pipe: Option<NamedPipeServer>,
-    dsr_bootstrap: Option<DsrBootstrap>,
+struct ConPtyBlockingReader {
+    output_rx: Arc<Mutex<Receiver<io::Result<Vec<u8>>>>>,
     buffered_output: VecDeque<u8>,
 }
 
-// OwnedHandle is Send+Sync; NamedPipeServer is Send.
-// The reader is only ever used from a single async task (via &mut self),
-// so Sync is safe.
-unsafe impl Sync for ConPtyAsyncReader {}
+unsafe impl Sync for ConPtyBlockingReader {}
 
-impl ConPtyAsyncReader {
+impl ConPtyBlockingReader {
     fn new(handle: OwnedHandle, dsr_bootstrap: Option<DsrBootstrap>) -> Self {
+        Self::from_receiver(spawn_blocking_conpty_reader(handle, dsr_bootstrap))
+    }
+
+    fn from_receiver(output_rx: Receiver<io::Result<Vec<u8>>>) -> Self {
         Self {
-            pending: Some(handle),
-            pipe: None,
-            dsr_bootstrap,
+            output_rx: Arc::new(Mutex::new(output_rx)),
             buffered_output: VecDeque::new(),
         }
     }
@@ -181,49 +162,104 @@ impl ConPtyAsyncReader {
 }
 
 #[async_trait]
-impl AsyncReader for ConPtyAsyncReader {
+impl AsyncReader for ConPtyBlockingReader {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         if let Some(bytes_read) = self.drain_buffered_output(buf) {
             return Ok(bytes_read);
         }
-        if let Some(dsr_bootstrap) = self.dsr_bootstrap.as_mut() {
-            if let Some(bytes_read) = dsr_bootstrap.drain_deferred(buf.len()) {
-                buf[..bytes_read.len()].copy_from_slice(&bytes_read);
-                if dsr_bootstrap.is_done() {
-                    self.dsr_bootstrap = None;
-                }
-                return Ok(bytes_read.len());
-            }
-        }
-        if let Some(handle) = self.pending.take() {
-            let pipe = unsafe { NamedPipeServer::from_raw_handle(handle.into_raw_handle()) }?;
-            self.pipe = Some(pipe);
-        }
-        let pipe = self
-            .pipe
-            .as_mut()
-            .expect("ConPtyAsyncReader used after init");
-        loop {
-            let bytes_read = pipe.read(buf).await?;
-            if bytes_read == 0 {
-                return Ok(0);
-            }
-            if let Some(dsr_bootstrap) = self.dsr_bootstrap.as_mut() {
-                let filtered = dsr_bootstrap.filter_to_len(&buf[..bytes_read], buf.len());
-                if dsr_bootstrap.is_done() {
-                    self.dsr_bootstrap = None;
-                }
-                if filtered.is_empty() {
-                    continue;
-                }
-                let bytes_to_copy = filtered.len().min(buf.len());
-                buf[..bytes_to_copy].copy_from_slice(&filtered[..bytes_to_copy]);
+
+        let output_rx = Arc::clone(&self.output_rx);
+        let received = tokio::task::spawn_blocking(move || {
+            output_rx
+                .lock()
+                .expect("ConPTY output receiver mutex poisoned")
+                .recv()
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("ConPTY reader task failed: {error}")))?;
+
+        match received {
+            Ok(Ok(bytes)) => {
+                let bytes_to_copy = bytes.len().min(buf.len());
+                buf[..bytes_to_copy].copy_from_slice(&bytes[..bytes_to_copy]);
                 self.buffered_output
-                    .extend(filtered[bytes_to_copy..].iter().copied());
-                return Ok(bytes_to_copy);
-            }
-            return Ok(bytes_read);
+                    .extend(bytes[bytes_to_copy..].iter().copied());
+                Ok(bytes_to_copy)
+            },
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(0),
         }
+    }
+}
+
+fn spawn_blocking_conpty_reader(
+    handle: OwnedHandle,
+    mut dsr_bootstrap: Option<DsrBootstrap>,
+) -> Receiver<io::Result<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("zellij-conpty-reader".to_owned())
+        .spawn(move || {
+            let mut buffer = vec![0_u8; CONPTY_READ_BUFFER_SIZE];
+            loop {
+                if let Some(dsr) = dsr_bootstrap.as_mut() {
+                    if let Some(bytes) = dsr.drain_deferred(CONPTY_READ_BUFFER_SIZE) {
+                        if dsr.is_done() {
+                            dsr_bootstrap = None;
+                        }
+                        if !bytes.is_empty() && tx.send(Ok(bytes)).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                match read_from_conpty_output(&handle, &mut buffer) {
+                    Ok(0) => break,
+                    Ok(bytes_read) => {
+                        let mut bytes = buffer[..bytes_read].to_vec();
+                        if let Some(dsr) = dsr_bootstrap.as_mut() {
+                            bytes = dsr.filter_to_len(&bytes, CONPTY_READ_BUFFER_SIZE);
+                            if dsr.is_done() {
+                                dsr_bootstrap = None;
+                            }
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                        }
+                        if tx.send(Ok(bytes)).is_err() {
+                            break;
+                        }
+                    },
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                        break;
+                    },
+                }
+            }
+        })
+        .expect("failed to spawn ConPTY reader thread");
+    rx
+}
+
+fn read_from_conpty_output(handle: &OwnedHandle, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut bytes_read = 0;
+    let ok = unsafe {
+        ReadFile(
+            handle.as_raw_handle() as HANDLE,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            &mut bytes_read,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        return Ok(bytes_read as usize);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error().map(|code| code as u32) {
+        Some(code) if code == ERROR_BROKEN_PIPE || code == ERROR_NO_DATA => Ok(0),
+        _ => Err(error),
     }
 }
 
@@ -526,54 +562,16 @@ fn current_windows_build() -> io::Result<u32> {
     }
 }
 
-/// Create an overlapped named-pipe pair for ConPTY output.
-///
-/// Returns `(server_read_handle, client_write_handle)` where the server
-/// (read) end has `FILE_FLAG_OVERLAPPED` for IOCP and the client (write) end
-/// is synchronous (required by ConPTY).
-fn create_overlapped_output_pipe(terminal_id: u32) -> io::Result<(HANDLE, HANDLE)> {
-    let seq = PIPE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let name = format!(
-        r"\\.\pipe\zellij-pty-{}-{}-{}",
-        std::process::id(),
-        terminal_id,
-        seq
-    );
-    let wide_name = to_wide(&name);
-
-    let server = unsafe {
-        CreateNamedPipeW(
-            wide_name.as_ptr(),
-            PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            PIPE_TYPE_BYTE | PIPE_WAIT,
-            1,     // max instances
-            0,     // out buffer (we only read)
-            65536, // in buffer
-            0,     // default timeout
-            std::ptr::null(),
-        )
-    };
-    if server == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
+fn create_anonymous_pipe() -> io::Result<(HANDLE, HANDLE)> {
+    let mut read: HANDLE = std::ptr::null_mut();
+    let mut write: HANDLE = std::ptr::null_mut();
+    if unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), CONPTY_READ_BUFFER_SIZE as u32) }
+        == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok((read, write))
     }
-
-    let client = unsafe {
-        CreateFileW(
-            wide_name.as_ptr(),
-            GENERIC_WRITE,
-            0,                    // no sharing
-            std::ptr::null(),     // default security
-            OPEN_EXISTING,        // pipe already exists
-            0,                    // synchronous
-            std::ptr::null_mut(), // no template
-        )
-    };
-    if client == INVALID_HANDLE_VALUE {
-        unsafe { CloseHandle(server) };
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok((server, client))
 }
 
 /// Create a ConPTY pseudo console of the given size attached to the provided
@@ -629,12 +627,20 @@ impl ConPtySpawnState {
     }
 }
 
-fn create_terminal_conpty(terminal_id: u32, flags: ConPtyFlags) -> io::Result<ConPtySpawnState> {
-    let (output_read, output_write) = create_overlapped_output_pipe(terminal_id)?;
+fn create_terminal_conpty(_terminal_id: u32, flags: ConPtyFlags) -> io::Result<ConPtySpawnState> {
+    let (output_read, output_write) = create_anonymous_pipe()?;
 
-    let mut input_read: HANDLE = std::ptr::null_mut();
-    let mut input_write: HANDLE = std::ptr::null_mut();
-    if unsafe { CreatePipe(&mut input_read, &mut input_write, std::ptr::null(), 0) } == 0 {
+    let (input_read, input_write) = match create_anonymous_pipe() {
+        Ok(pipe) => pipe,
+        Err(error) => {
+            unsafe {
+                CloseHandle(output_read);
+                CloseHandle(output_write);
+            }
+            return Err(error);
+        },
+    };
+    if input_read == INVALID_HANDLE_VALUE || input_write == INVALID_HANDLE_VALUE {
         unsafe {
             CloseHandle(output_read);
             CloseHandle(output_write);
@@ -862,7 +868,7 @@ fn terminate_process(pid: u32) -> std::result::Result<(), std::io::Error> {
 // WindowsPtyBackend
 // ---------------------------------------------------------------------------
 
-/// Windows PTY backend using native ConPTY with IOCP-based async I/O.
+/// Windows PTY backend using native ConPTY with a blocking output reader thread.
 #[derive(Clone)]
 pub(crate) struct WindowsPtyBackend {
     terminals: Arc<Mutex<BTreeMap<u32, Option<ConPtyTerminal>>>>,
@@ -954,12 +960,13 @@ impl WindowsPtyBackend {
             );
         });
 
-        // 8. Wrap the output read handle in an async reader
+        // 8. Wrap the output read handle in an async reader backed by a blocking thread.
         let owned =
             unsafe { OwnedHandle::from_raw_handle(conpty.output_read as *mut core::ffi::c_void) };
         let dsr_bootstrap =
             command_uses_powershell(&cmd).then_some(DsrBootstrap::new(conpty.input_write));
-        let reader = Box::new(ConPtyAsyncReader::new(owned, dsr_bootstrap)) as Box<dyn AsyncReader>;
+        let reader =
+            Box::new(ConPtyBlockingReader::new(owned, dsr_bootstrap)) as Box<dyn AsyncReader>;
 
         Ok((reader, child_pid))
     }
@@ -1331,5 +1338,35 @@ mod tests {
             passthrough,
             &io::Error::from_raw_os_error(5)
         ));
+    }
+
+    #[tokio::test]
+    async fn blocking_reader_buffers_chunk_tail() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(b"abcdef".to_vec())).expect("send chunk");
+        drop(tx);
+        let mut reader = ConPtyBlockingReader::from_receiver(rx);
+        let mut buf = [0_u8; 2];
+
+        assert_eq!(reader.read(&mut buf).await.expect("first read"), 2);
+        assert_eq!(&buf, b"ab");
+        assert_eq!(reader.read(&mut buf).await.expect("second read"), 2);
+        assert_eq!(&buf, b"cd");
+        assert_eq!(reader.read(&mut buf).await.expect("third read"), 2);
+        assert_eq!(&buf, b"ef");
+        assert_eq!(reader.read(&mut buf).await.expect("eof"), 0);
+    }
+
+    #[tokio::test]
+    async fn blocking_reader_propagates_read_error() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(io::Error::from_raw_os_error(5)))
+            .expect("send error");
+        let mut reader = ConPtyBlockingReader::from_receiver(rx);
+        let mut buf = [0_u8; 8];
+
+        let error = reader.read(&mut buf).await.expect_err("read error");
+
+        assert_eq!(error.raw_os_error(), Some(5));
     }
 }
