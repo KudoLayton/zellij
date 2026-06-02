@@ -17,6 +17,7 @@ pub(crate) struct TerminalBytes {
     debug: bool,
     activity_flag: Arc<AtomicBool>,
     stream_guard: TerminalStreamGuard,
+    output_sequence: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -46,8 +47,45 @@ impl TerminalStreamGuard {
         self.current_generation.fetch_add(1, Ordering::AcqRel);
     }
 
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn is_current(&self) -> bool {
         self.current_generation.load(Ordering::Acquire) == self.generation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalOutput {
+    pub(crate) terminal_id: u32,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) sequence: Option<u64>,
+}
+
+impl TerminalOutput {
+    pub(crate) fn guarded(
+        terminal_id: u32,
+        bytes: Vec<u8>,
+        generation: u64,
+        sequence: u64,
+    ) -> Self {
+        Self {
+            terminal_id,
+            bytes,
+            generation: Some(generation),
+            sequence: Some(sequence),
+        }
+    }
+
+    pub(crate) fn unguarded(terminal_id: u32, bytes: Vec<u8>) -> Self {
+        Self {
+            terminal_id,
+            bytes,
+            generation: None,
+            sequence: None,
+        }
     }
 }
 
@@ -67,6 +105,7 @@ impl TerminalBytes {
             async_reader,
             activity_flag,
             stream_guard,
+            output_sequence: 0,
         }
     }
 
@@ -103,12 +142,16 @@ impl TerminalBytes {
                     if self.debug {
                         let _ = debug_to_file(bytes, self.terminal_id as i32);
                     }
-                    self.async_send_to_screen(ScreenInstruction::PtyBytes(
+                    let output = TerminalOutput::guarded(
                         self.terminal_id,
                         bytes.to_vec(),
-                    ))
-                    .await
-                    .with_context(err_context)?;
+                        self.stream_guard.generation(),
+                        self.output_sequence,
+                    );
+                    self.output_sequence = self.output_sequence.saturating_add(1);
+                    self.async_send_to_screen(ScreenInstruction::PtyBytes(output))
+                        .await
+                        .with_context(err_context)?;
                 },
             }
         }
@@ -164,5 +207,23 @@ mod tests {
         fresh_guard.invalidate();
 
         assert!(!fresh_guard.is_current());
+    }
+
+    #[test]
+    fn guarded_terminal_output_carries_generation_and_sequence() {
+        let output = TerminalOutput::guarded(1, b"hello".to_vec(), 2, 3);
+
+        assert_eq!(output.terminal_id, 1);
+        assert_eq!(output.bytes, b"hello");
+        assert_eq!(output.generation, Some(2));
+        assert_eq!(output.sequence, Some(3));
+    }
+
+    #[test]
+    fn unguarded_terminal_output_has_no_generation_or_sequence() {
+        let output = TerminalOutput::unguarded(1, b"internal".to_vec());
+
+        assert_eq!(output.generation, None);
+        assert_eq!(output.sequence, None);
     }
 }

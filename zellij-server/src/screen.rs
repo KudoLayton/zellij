@@ -79,9 +79,11 @@ use crate::{
     panes::sixel::SixelImageStore,
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction, PluginRenderAsset},
-    pty::{get_default_shell, ClientTabIndexOrPaneId, PtyInstruction, VteBytes},
+    pty::{get_default_shell, ClientTabIndexOrPaneId, PtyInstruction},
     pty_writer::PtyWriteInstruction,
     tab::{SuppressedPanes, Tab},
+    terminal_bytes::TerminalOutput,
+    terminal_output::TerminalOutputStore,
     thread_bus::Bus,
     ui::loading_indication::LoadingIndication,
     ClientId, ServerInstruction,
@@ -318,7 +320,7 @@ pub struct TabOverrideResult {
 /// Instructions that can be sent to the [`Screen`].
 #[derive(Debug, Clone)]
 pub enum ScreenInstruction {
-    PtyBytes(u32, VteBytes),
+    PtyBytes(TerminalOutput),
     PluginBytes(Vec<PluginRenderAsset>),
     Render,
     RenderToClients,
@@ -873,6 +875,58 @@ pub enum ScreenInstruction {
     MoveTabWithTabId(usize, Direction, Option<NotificationEnd>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalOutputCursor {
+    generation: u64,
+    last_sequence: Option<u64>,
+}
+
+impl TerminalOutputCursor {
+    fn accepts(&mut self, generation: u64, sequence: Option<u64>) -> bool {
+        if generation < self.generation {
+            return false;
+        }
+        if generation > self.generation {
+            self.generation = generation;
+            self.last_sequence = sequence;
+            return true;
+        }
+        let Some(sequence) = sequence else {
+            return true;
+        };
+        if self
+            .last_sequence
+            .is_some_and(|last_sequence| sequence <= last_sequence)
+        {
+            return false;
+        }
+        self.last_sequence = Some(sequence);
+        true
+    }
+}
+
+fn accept_terminal_output(
+    cursors: &mut HashMap<u32, TerminalOutputCursor>,
+    output: &TerminalOutput,
+) -> bool {
+    let Some(generation) = output.generation else {
+        return true;
+    };
+    match cursors.get_mut(&output.terminal_id) {
+        Some(cursor) => cursor.accepts(generation, output.sequence),
+        None => {
+            cursors.insert(
+                output.terminal_id,
+                TerminalOutputCursor {
+                    generation,
+                    last_sequence: output.sequence,
+                },
+            );
+            true
+        },
+    }
+}
+
 impl From<&ScreenInstruction> for ScreenContext {
     fn from(screen_instruction: &ScreenInstruction) -> Self {
         match *screen_instruction {
@@ -1423,6 +1477,8 @@ pub(crate) struct Screen {
     web_server_port: u16,
     render_blocker: RenderBlocker,
     watcher_clients: HashMap<ClientId, WatcherState>,
+    terminal_output_generations: HashMap<u32, TerminalOutputCursor>,
+    terminal_output_store: TerminalOutputStore,
     followed_client_id: Option<ClientId>,
     cached_layouts: Vec<LayoutInfo>,
     cached_layout_errors: Vec<LayoutWithError>,
@@ -1606,6 +1662,8 @@ impl Screen {
             web_server_port,
             render_blocker: RenderBlocker::new(100),
             watcher_clients: HashMap::new(),
+            terminal_output_generations: HashMap::new(),
+            terminal_output_store: TerminalOutputStore::new(),
             followed_client_id: None,
             cached_layouts: vec![],
             cached_layout_errors: vec![],
@@ -5794,23 +5852,33 @@ pub(crate) fn screen_thread_main(
         let _resize_cache = ResizeCache::new(thread_senders.clone());
 
         match event {
-            ScreenInstruction::PtyBytes(pid, vte_bytes) => {
-                let all_tabs = screen.get_tabs_mut();
-                let mut vte_bytes = Some(vte_bytes);
-                for tab in all_tabs.values_mut() {
-                    if tab.has_terminal_pid(pid) {
-                        if let Some(bytes) = vte_bytes.take() {
-                            tab.handle_pty_bytes(pid, bytes)
-                                .context("failed to process pty bytes")?;
-                        }
-                        break;
+            ScreenInstruction::PtyBytes(output) => {
+                let pid = output.terminal_id;
+                let terminal_exists = screen
+                    .get_tabs()
+                    .values()
+                    .any(|tab| tab.has_terminal_pid(pid));
+                if terminal_exists {
+                    if !accept_terminal_output(&mut screen.terminal_output_generations, &output) {
+                        continue;
                     }
-                }
-                if let Some(vte_bytes) = vte_bytes {
+                    let _ = screen.terminal_output_store.push(&output);
+                    let all_tabs = screen.get_tabs_mut();
+                    let mut bytes = Some(output.bytes);
+                    for tab in all_tabs.values_mut() {
+                        if tab.has_terminal_pid(pid) {
+                            if let Some(bytes) = bytes.take() {
+                                tab.handle_pty_bytes(pid, bytes)
+                                    .context("failed to process pty bytes")?;
+                            }
+                            break;
+                        }
+                    }
+                } else {
                     pending_events_waiting_for_pane
                         .entry(PaneId::Terminal(pid))
                         .or_default()
-                        .push(ScreenInstruction::PtyBytes(pid, vte_bytes));
+                        .push(ScreenInstruction::PtyBytes(output));
                 }
                 let _ = screen
                     .bus
@@ -9972,6 +10040,44 @@ pub(crate) fn screen_thread_main(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod terminal_output_generation_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_output_rejects_stale_generation() {
+        let mut cursors = HashMap::new();
+        let fresh = TerminalOutput::guarded(1, b"fresh".to_vec(), 2, 0);
+        let stale = TerminalOutput::guarded(1, b"stale".to_vec(), 1, 0);
+
+        assert!(accept_terminal_output(&mut cursors, &fresh));
+        assert!(!accept_terminal_output(&mut cursors, &stale));
+    }
+
+    #[test]
+    fn terminal_output_rejects_replayed_sequence() {
+        let mut cursors = HashMap::new();
+        let first = TerminalOutput::guarded(1, b"first".to_vec(), 1, 1);
+        let replay = TerminalOutput::guarded(1, b"replay".to_vec(), 1, 1);
+        let older = TerminalOutput::guarded(1, b"older".to_vec(), 1, 0);
+        let next = TerminalOutput::guarded(1, b"next".to_vec(), 1, 2);
+
+        assert!(accept_terminal_output(&mut cursors, &first));
+        assert!(!accept_terminal_output(&mut cursors, &replay));
+        assert!(!accept_terminal_output(&mut cursors, &older));
+        assert!(accept_terminal_output(&mut cursors, &next));
+    }
+
+    #[test]
+    fn terminal_output_accepts_unguarded_internal_bytes() {
+        let mut cursors = HashMap::new();
+        let internal = TerminalOutput::unguarded(1, b"internal".to_vec());
+
+        assert!(accept_terminal_output(&mut cursors, &internal));
+        assert!(cursors.is_empty());
+    }
 }
 
 #[path = "./unit/screen_tests.rs"]

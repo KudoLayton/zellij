@@ -3,7 +3,7 @@ use crate::background_jobs::BackgroundJob;
 use crate::global_async_runtime::get_tokio_runtime as async_runtime;
 use crate::os_input_output::{AsyncReader, NullAsyncReader};
 use crate::route::NotificationEnd;
-use crate::terminal_bytes::{TerminalBytes, TerminalStreamGuard};
+use crate::terminal_bytes::{TerminalBytes, TerminalOutput, TerminalStreamGuard};
 use crate::{
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction},
@@ -608,13 +608,15 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                                 pty.bus
                                     .senders
                                     .send_to_screen(ScreenInstruction::PtyBytes(
-                                        *terminal_id,
-                                        format!(
-                                            "Command not found: {}",
-                                            run_command.command.display()
-                                        )
-                                        .as_bytes()
-                                        .to_vec(),
+                                        TerminalOutput::unguarded(
+                                            *terminal_id,
+                                            format!(
+                                                "Command not found: {}",
+                                                run_command.command.display()
+                                            )
+                                            .as_bytes()
+                                            .to_vec(),
+                                        ),
                                     ))
                                     .with_context(err_context)?;
                                 pty.bus
@@ -660,13 +662,15 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                                 pty.bus
                                     .senders
                                     .send_to_screen(ScreenInstruction::PtyBytes(
-                                        *terminal_id,
-                                        format!(
-                                            "Command not found: {}",
-                                            run_command.command.display()
-                                        )
-                                        .as_bytes()
-                                        .to_vec(),
+                                        TerminalOutput::unguarded(
+                                            *terminal_id,
+                                            format!(
+                                                "Command not found: {}",
+                                                run_command.command.display()
+                                            )
+                                            .as_bytes()
+                                            .to_vec(),
+                                        ),
                                     ))
                                     .with_context(err_context)?;
                                 pty.bus
@@ -2407,12 +2411,12 @@ fn send_command_not_found_to_screen(
 ) -> Result<()> {
     let err_context = || format!("failed to send command_not_fount for terminal {terminal_id}");
     senders
-        .send_to_screen(ScreenInstruction::PtyBytes(
+        .send_to_screen(ScreenInstruction::PtyBytes(TerminalOutput::unguarded(
             terminal_id,
             format!("Command not found: {}\n\rIf you were including arguments as part of the command, try including them as 'args' instead.", run_command.command.display())
                 .as_bytes()
                 .to_vec(),
-        ))
+        )))
         .with_context(err_context)?;
     senders
         .send_to_screen(ScreenInstruction::HoldPane(

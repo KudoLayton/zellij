@@ -22,6 +22,7 @@ mod route;
 mod screen;
 mod session_layout_metadata;
 mod terminal_bytes;
+mod terminal_output;
 mod thread_bus;
 mod ui;
 
@@ -644,6 +645,9 @@ impl SessionState {
     pub fn watcher_client_ids(&self) -> Vec<ClientId> {
         self.watchers.keys().copied().collect()
     }
+    pub fn client_is_connected(&self, client_id: ClientId) -> bool {
+        self.clients.contains_key(&client_id) || self.watchers.contains_key(&client_id)
+    }
     pub fn web_client_ids(&self) -> Vec<ClientId> {
         self.clients
             .iter()
@@ -760,6 +764,23 @@ mod session_state_tests {
     fn pick_forward_target_none_when_no_clients() {
         let s = SessionState::new();
         assert_eq!(s.pick_forward_target(), None);
+    }
+
+    #[test]
+    fn client_is_connected_rejects_removed_render_targets() {
+        let mut s = SessionState::new();
+        s.clients.insert(1, None);
+        s.watchers.insert(2, false);
+
+        assert!(s.client_is_connected(1));
+        assert!(s.client_is_connected(2));
+        assert!(!s.client_is_connected(3));
+
+        s.remove_client(1);
+        s.remove_watcher(2);
+
+        assert!(!s.client_is_connected(1));
+        assert!(!s.client_is_connected(2));
     }
 
     #[test]
@@ -1436,6 +1457,13 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                 // If `None`- Send an exit instruction. This is the case when a user closes the last Tab/Pane.
                 if let Some(output) = &serialized_output {
                     for (client_id, client_render_instruction) in output.iter() {
+                        if !session_state
+                            .read()
+                            .unwrap()
+                            .client_is_connected(*client_id)
+                        {
+                            continue;
+                        }
                         send_to_client!(
                             *client_id,
                             os_input,

@@ -26,6 +26,7 @@ use zellij_utils::position::Position;
 use crate::background_jobs::BackgroundJob;
 use crate::os_input_output::AsyncReader;
 use crate::pty_writer::PtyWriteInstruction;
+use crate::terminal_bytes::TerminalOutput;
 use std::collections::HashSet;
 use std::env::set_var;
 use std::sync::{Arc, Mutex};
@@ -42,6 +43,10 @@ use zellij_utils::{
     data::{Direction, FloatingPaneCoordinates, InputMode, ModeInfo, NewPanePlacement, Palette},
     ipc::{ClientAttributes, ClientToServerMsg, ServerToClientMsg},
 };
+
+fn pty_bytes(terminal_id: u32, bytes: Vec<u8>) -> ScreenInstruction {
+    ScreenInstruction::PtyBytes(TerminalOutput::unguarded(terminal_id, bytes))
+}
 
 use crate::panes::grid::Grid;
 use crate::panes::link_handler::LinkHandler;
@@ -2600,7 +2605,7 @@ pub fn send_cli_dump_screen_action() {
         pane_id: None,
         ansi: false,
     };
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+    let _ = mock_screen.to_screen.send(pty_bytes(
         0,
         "fill pane up with something".as_bytes().to_vec(),
     ));
@@ -2634,7 +2639,7 @@ pub fn send_cli_edit_scrollback_action() {
         pane_id: None,
         ansi: false,
     };
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+    let _ = mock_screen.to_screen.send(pty_bytes(
         0,
         "fill pane up with something".as_bytes().to_vec(),
     ));
@@ -2690,10 +2695,9 @@ pub fn send_cli_scroll_up_action() {
     for i in 0..20 {
         pane_contents.push_str(&format!("fill pane up with something {}\n\r", i));
     }
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        pane_contents.as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, pane_contents.as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
     // we send two actions here because only the last line in the pane is empty, so one action
     // won't show in a render
@@ -2735,10 +2739,9 @@ pub fn send_cli_scroll_down_action() {
     for i in 0..20 {
         pane_contents.push_str(&format!("fill pane up with something {}\n\r", i));
     }
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        pane_contents.as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, pane_contents.as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
     // scroll up some
     send_cli_action_to_server(&session_metadata, scroll_up_cli_action.clone(), client_id);
@@ -2782,10 +2785,9 @@ pub fn send_cli_scroll_to_bottom_action() {
     for i in 0..20 {
         pane_contents.push_str(&format!("fill pane up with something {}\n\r", i));
     }
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        pane_contents.as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, pane_contents.as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
     // scroll up some
     send_cli_action_to_server(&session_metadata, scroll_up_cli_action.clone(), client_id);
@@ -2831,10 +2833,9 @@ pub fn send_cli_scroll_to_top_action() {
     for i in 0..20 {
         pane_contents.push_str(&format!("fill pane up with something {}\n\r", i));
     }
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        pane_contents.as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, pane_contents.as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
     // scroll to top
     send_cli_action_to_server(&session_metadata, scroll_to_top_action.clone(), client_id);
@@ -2874,10 +2875,9 @@ pub fn send_cli_page_scroll_up_action() {
     for i in 0..20 {
         pane_contents.push_str(&format!("fill pane up with something {}\n\r", i));
     }
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        pane_contents.as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, pane_contents.as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
     send_cli_action_to_server(&session_metadata, page_scroll_up_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2917,10 +2917,9 @@ pub fn send_cli_page_scroll_down_action() {
         pane_contents.push_str(&format!("fill pane up with something {}\n\r", i));
     }
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for the async render
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        pane_contents.as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, pane_contents.as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // scroll up some
@@ -2967,10 +2966,9 @@ pub fn send_cli_half_page_scroll_up_action() {
     for i in 0..20 {
         pane_contents.push_str(&format!("fill pane up with something {}\n\r", i));
     }
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        pane_contents.as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, pane_contents.as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
     send_cli_action_to_server(&session_metadata, half_page_scroll_up_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -3010,10 +3008,9 @@ pub fn send_cli_half_page_scroll_down_action() {
     for i in 0..20 {
         pane_contents.push_str(&format!("fill pane up with something {}\n\r", i));
     }
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        pane_contents.as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, pane_contents.as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // scroll up some
@@ -5977,10 +5974,9 @@ fn integration_pty_bytes_delivered_to_subscriber() {
         });
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        "hello world\r\n".as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, "hello world\r\n".as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     mock_screen.teardown(vec![server_thread, plugin_thread, screen_thread]);
@@ -6105,7 +6101,7 @@ fn integration_scrollback_from_pre_subscription_pty_bytes() {
     }
     let _ = mock_screen
         .to_screen
-        .send(ScreenInstruction::PtyBytes(0, data.as_bytes().to_vec()));
+        .send(pty_bytes(0, data.as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     let _ = mock_screen
@@ -6118,10 +6114,9 @@ fn integration_scrollback_from_pre_subscription_pty_bytes() {
         });
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        "post subscribe line\r\n".as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, "post subscribe line\r\n".as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     mock_screen.teardown(vec![server_thread, plugin_thread, screen_thread]);
@@ -6222,7 +6217,7 @@ fn integration_no_scrollback_when_not_requested() {
     }
     let _ = mock_screen
         .to_screen
-        .send(ScreenInstruction::PtyBytes(0, data.as_bytes().to_vec()));
+        .send(pty_bytes(0, data.as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     let _ = mock_screen
@@ -6235,10 +6230,9 @@ fn integration_no_scrollback_when_not_requested() {
         });
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        "post subscribe\r\n".as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, "post subscribe\r\n".as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     mock_screen.teardown(vec![server_thread, plugin_thread, screen_thread]);
@@ -6301,10 +6295,9 @@ fn integration_subscriber_survives_after_regular_client_detach() {
         .send(ScreenInstruction::RemoveClient(1));
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        "after detach\r\n".as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, "after detach\r\n".as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     mock_screen.teardown(vec![server_thread, plugin_thread, screen_thread]);
@@ -7199,10 +7192,9 @@ pub fn send_cli_dump_screen_action_with_ansi() {
         pane_id: None,
         ansi: true,
     };
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        "\x1b[31mred text\x1b[0m".as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, "\x1b[31mred text\x1b[0m".as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7239,10 +7231,9 @@ pub fn send_cli_dump_screen_action_without_ansi_strips_codes() {
         pane_id: None,
         ansi: false,
     };
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        "\x1b[31mred text\x1b[0m".as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, "\x1b[31mred text\x1b[0m".as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7277,10 +7268,9 @@ pub fn send_cli_edit_scrollback_action_with_ansi() {
         pane_id: None,
         ansi: true,
     };
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        0,
-        "\x1b[31mred text\x1b[0m".as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(0, "\x1b[31mred text\x1b[0m".as_bytes().to_vec()));
     std::thread::sleep(std::time::Duration::from_millis(100));
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7478,7 +7468,7 @@ fn integration_subscribe_with_ansi_flag() {
         });
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+    let _ = mock_screen.to_screen.send(pty_bytes(
         0,
         "\x1b[31mred text\x1b[0m\r\n".as_bytes().to_vec(),
     ));
@@ -8277,10 +8267,9 @@ pub fn pty_bytes_and_hold_pane_buffered_before_new_pane() {
     let new_pane_id = 2;
 
     // Simulate the race: send PtyBytes for the new pane BEFORE NewPane
-    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
-        new_pane_id,
-        "hello\r\n".as_bytes().to_vec(),
-    ));
+    let _ = mock_screen
+        .to_screen
+        .send(pty_bytes(new_pane_id, "hello\r\n".as_bytes().to_vec()));
 
     // Send HoldPane before NewPane as well
     let run_command = RunCommand {
