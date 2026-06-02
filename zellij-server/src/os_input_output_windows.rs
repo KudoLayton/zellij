@@ -12,7 +12,6 @@ use std::{
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     sync::{
         atomic::{AtomicU32, Ordering},
-        mpsc::{self, Receiver},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -39,7 +38,7 @@ use windows_sys::Win32::System::Threading::{
     InitializeProcThreadAttributeList, OpenProcess, ResumeThread, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
-    PROCESS_TERMINATE, STARTUPINFOEXW, STARTUPINFOW,
+    PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 use zellij_utils::{errors::prelude::*, input::command::RunCommand};
@@ -131,7 +130,7 @@ impl Drop for ConPtyTerminal {
 }
 
 struct ConPtyBlockingReader {
-    output_rx: Arc<Mutex<Receiver<io::Result<Vec<u8>>>>>,
+    output_rx: UnboundedReceiver<io::Result<Vec<u8>>>,
     buffered_output: VecDeque<u8>,
 }
 
@@ -142,9 +141,9 @@ impl ConPtyBlockingReader {
         Self::from_receiver(spawn_blocking_conpty_reader(handle, dsr_bootstrap))
     }
 
-    fn from_receiver(output_rx: Receiver<io::Result<Vec<u8>>>) -> Self {
+    fn from_receiver(output_rx: UnboundedReceiver<io::Result<Vec<u8>>>) -> Self {
         Self {
-            output_rx: Arc::new(Mutex::new(output_rx)),
+            output_rx,
             buffered_output: VecDeque::new(),
         }
     }
@@ -168,26 +167,16 @@ impl AsyncReader for ConPtyBlockingReader {
             return Ok(bytes_read);
         }
 
-        let output_rx = Arc::clone(&self.output_rx);
-        let received = tokio::task::spawn_blocking(move || {
-            output_rx
-                .lock()
-                .expect("ConPTY output receiver mutex poisoned")
-                .recv()
-        })
-        .await
-        .map_err(|error| io::Error::other(format!("ConPTY reader task failed: {error}")))?;
-
-        match received {
-            Ok(Ok(bytes)) => {
+        match self.output_rx.recv().await {
+            Some(Ok(bytes)) => {
                 let bytes_to_copy = bytes.len().min(buf.len());
                 buf[..bytes_to_copy].copy_from_slice(&bytes[..bytes_to_copy]);
                 self.buffered_output
                     .extend(bytes[bytes_to_copy..].iter().copied());
                 Ok(bytes_to_copy)
             },
-            Ok(Err(error)) => Err(error),
-            Err(_) => Ok(0),
+            Some(Err(error)) => Err(error),
+            None => Ok(0),
         }
     }
 }
@@ -195,8 +184,8 @@ impl AsyncReader for ConPtyBlockingReader {
 fn spawn_blocking_conpty_reader(
     handle: OwnedHandle,
     mut dsr_bootstrap: Option<DsrBootstrap>,
-) -> Receiver<io::Result<Vec<u8>>> {
-    let (tx, rx) = mpsc::channel();
+) -> UnboundedReceiver<io::Result<Vec<u8>>> {
+    let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("zellij-conpty-reader".to_owned())
         .spawn(move || {
@@ -781,6 +770,10 @@ fn spawn_child_process_attempt(
     // --- startup info ---
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+    si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+    si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
     si.lpAttributeList = attr_list;
 
     // --- command line & environment ---
@@ -1342,7 +1335,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_reader_buffers_chunk_tail() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::unbounded_channel();
         tx.send(Ok(b"abcdef".to_vec())).expect("send chunk");
         drop(tx);
         let mut reader = ConPtyBlockingReader::from_receiver(rx);
@@ -1359,7 +1352,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_reader_propagates_read_error() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::unbounded_channel();
         tx.send(Err(io::Error::from_raw_os_error(5)))
             .expect("send error");
         let mut reader = ConPtyBlockingReader::from_receiver(rx);
@@ -1369,4 +1362,67 @@ mod tests {
 
         assert_eq!(error.raw_os_error(), Some(5));
     }
+
+    #[tokio::test]
+    async fn blocking_reader_reads_real_conpty_output_until_exit() {
+        let marker = "ZELLIJ_BLOCKING_CONPTY_OK";
+        let cmd = RunCommand {
+            command: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            args: vec![
+                "/D".to_owned(),
+                "/C".to_owned(),
+                "echo".to_owned(),
+                marker.to_owned(),
+            ],
+            ..Default::default()
+        };
+        let conpty =
+            create_terminal_conpty(10_001, conpty_flags_without_passthrough()).expect("ConPTY");
+        let (process_handle, thread_handle, _child_pid, job_handle) =
+            spawn_child_process(conpty.hpcon, &cmd, 10_001).expect("spawn child");
+        unsafe { CloseHandle(thread_handle) };
+        let output_read =
+            unsafe { OwnedHandle::from_raw_handle(conpty.output_read as *mut core::ffi::c_void) };
+        let mut reader = ConPtyBlockingReader::new(output_read, None);
+        let mut output = Vec::new();
+        let mut buf = [0_u8; 1024];
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for ConPTY output: {}",
+                String::from_utf8_lossy(&output)
+            );
+            match tokio::time::timeout(remaining.min(Duration::from_millis(500)), reader.read(&mut buf))
+                .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(bytes_read)) => {
+                    output.extend_from_slice(&buf[..bytes_read]);
+                    if String::from_utf8_lossy(&output).contains(marker) {
+                        break;
+                    }
+                },
+                Ok(Err(error)) => panic!("ConPTY read failed: {error}"),
+                Err(_) => continue,
+            }
+        }
+
+        unsafe {
+            WaitForSingleObject(process_handle, INFINITE);
+            ClosePseudoConsole(conpty.hpcon);
+            CloseHandle(process_handle);
+            CloseHandle(conpty.input_write);
+            CloseHandle(job_handle);
+        }
+
+        assert!(
+            String::from_utf8_lossy(&output).contains(marker),
+            "expected marker in ConPTY output, got: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 }
+use tokio::sync::mpsc::{self, UnboundedReceiver};
