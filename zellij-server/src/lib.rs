@@ -828,6 +828,22 @@ mod session_state_tests {
     }
 
     #[test]
+    fn connected_render_targets_returns_empty_when_all_targets_were_removed() {
+        let mut s = SessionState::new();
+        s.clients.insert(1, None);
+        s.watchers.insert(2, false);
+        s.remove_client(1);
+        s.remove_watcher(2);
+
+        let output = HashMap::from([
+            (1, "removed-client".to_owned()),
+            (2, "removed-watcher".to_owned()),
+        ]);
+
+        assert!(s.connected_render_targets(&output).is_empty());
+    }
+
+    #[test]
     fn remove_client_returns_stuck_forward_tokens() {
         let mut s = with_client(1);
         s.mark_forward_in_flight(10, 1);

@@ -5729,6 +5729,15 @@ fn subscriber_partial_close() {
             .len(),
         1
     );
+    let subscription = screen.pane_render_subscribers.get(&100).unwrap();
+    assert!(!subscription
+        .previous_viewports
+        .contains_key(&zellij_utils::data::PaneId::Terminal(1)));
+    assert!(!subscription.terminal_output_cursors.contains_key(&1));
+    assert!(subscription
+        .previous_viewports
+        .contains_key(&zellij_utils::data::PaneId::Terminal(2)));
+    assert!(subscription.terminal_output_cursors.contains_key(&2));
 }
 
 #[test]

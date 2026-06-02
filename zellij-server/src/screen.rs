@@ -5637,6 +5637,10 @@ impl Screen {
 
         for (subscriber_id, subscription) in &mut self.pane_render_subscribers {
             if subscription.pane_ids.remove(&pane_id) {
+                subscription.previous_viewports.remove(&pane_id);
+                if let zellij_utils::data::PaneId::Terminal(terminal_id) = pane_id {
+                    subscription.terminal_output_cursors.remove(&terminal_id);
+                }
                 if let Some(os_input) = &self.bus.os_input {
                     let _ = os_input.send_to_client(
                         *subscriber_id,
