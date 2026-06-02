@@ -11,22 +11,20 @@ pub(crate) struct TerminalOutputEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
 pub(crate) struct TerminalOutputCursor {
     next_sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(test)]
 pub(crate) struct TerminalOutputGap {
     pub(crate) expected_sequence: u64,
     pub(crate) resume_sequence: u64,
     pub(crate) skipped_events: u64,
+    pub(crate) newest_sequence: u64,
     pub(crate) recent_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(test)]
 pub(crate) enum TerminalOutputCursorItem {
     Event(TerminalOutputEvent),
     Gap(TerminalOutputGap),
@@ -83,16 +81,14 @@ impl TerminalOutputStore {
             .unwrap_or(TerminalOutputCursor { next_sequence: 0 })
     }
 
-    #[cfg(test)]
-    fn cursor_from_now(&self, terminal_id: u32) -> TerminalOutputCursor {
+    pub(crate) fn cursor_from_now(&self, terminal_id: u32) -> TerminalOutputCursor {
         self.terminals
             .get(&terminal_id)
             .map(TerminalOutputRing::cursor_from_now)
             .unwrap_or(TerminalOutputCursor { next_sequence: 0 })
     }
 
-    #[cfg(test)]
-    fn poll_cursor(
+    pub(crate) fn poll_cursor(
         &self,
         terminal_id: u32,
         cursor: &mut TerminalOutputCursor,
@@ -100,6 +96,26 @@ impl TerminalOutputStore {
         self.terminals
             .get(&terminal_id)
             .and_then(|ring| ring.poll_cursor(cursor))
+    }
+
+    pub(crate) fn drain_cursor(
+        &self,
+        terminal_id: u32,
+        cursor: &mut TerminalOutputCursor,
+        limit: usize,
+    ) -> Vec<TerminalOutputCursorItem> {
+        let mut drained = Vec::new();
+        for _ in 0..limit {
+            let Some(item) = self.poll_cursor(terminal_id, cursor) else {
+                break;
+            };
+            let is_gap = matches!(item, TerminalOutputCursorItem::Gap(_));
+            drained.push(item);
+            if is_gap {
+                break;
+            }
+        }
+        drained
     }
 }
 
@@ -151,14 +167,12 @@ impl TerminalOutputRing {
         }
     }
 
-    #[cfg(test)]
     fn cursor_from_now(&self) -> TerminalOutputCursor {
         TerminalOutputCursor {
             next_sequence: self.next_sequence(),
         }
     }
 
-    #[cfg(test)]
     fn poll_cursor(&self, cursor: &mut TerminalOutputCursor) -> Option<TerminalOutputCursorItem> {
         if self.events.is_empty() {
             return None;
@@ -171,6 +185,7 @@ impl TerminalOutputRing {
                 expected_sequence,
                 resume_sequence: oldest_sequence,
                 skipped_events: oldest_sequence.saturating_sub(expected_sequence),
+                newest_sequence: self.newest_sequence(),
                 recent_bytes: self.recent_bytes.iter().copied().collect(),
             }));
         }
@@ -182,17 +197,19 @@ impl TerminalOutputRing {
         Some(TerminalOutputCursorItem::Event(event.clone()))
     }
 
-    #[cfg(test)]
     fn oldest_sequence(&self) -> u64 {
         self.events.front().map(|event| event.sequence).unwrap_or(0)
     }
 
-    #[cfg(test)]
     fn next_sequence(&self) -> u64 {
         self.events
             .back()
             .map(|event| event.sequence.saturating_add(1))
             .unwrap_or(0)
+    }
+
+    fn newest_sequence(&self) -> u64 {
+        self.events.back().map(|event| event.sequence).unwrap_or(0)
     }
 
     fn append_recent_bytes(&mut self, bytes: &[u8]) {
@@ -251,8 +268,45 @@ mod tests {
                 expected_sequence: 0,
                 resume_sequence: 1,
                 skipped_events: 1,
+                newest_sequence: 2,
                 recent_bytes: b"aabbcc".to_vec(),
             }))
+        );
+    }
+
+    #[test]
+    fn drain_cursor_reports_gap_once_then_resumes_at_oldest() {
+        let mut store = TerminalOutputStore::with_limits(2, 64);
+        let mut cursor = store.cursor_from_oldest(1);
+        store.push(&output(1, 1, 0, b"zero"));
+        store.push(&output(1, 1, 1, b"one"));
+        store.push(&output(1, 1, 2, b"two"));
+
+        let first_batch = store.drain_cursor(1, &mut cursor, 8);
+        assert_eq!(
+            first_batch,
+            vec![TerminalOutputCursorItem::Gap(TerminalOutputGap {
+                expected_sequence: 0,
+                resume_sequence: 1,
+                skipped_events: 1,
+                newest_sequence: 2,
+                recent_bytes: b"zeroonetwo".to_vec(),
+            })]
+        );
+
+        let second_batch = store.drain_cursor(1, &mut cursor, 8);
+        assert_eq!(
+            second_batch,
+            vec![
+                TerminalOutputCursorItem::Event(TerminalOutputEvent {
+                    sequence: 1,
+                    bytes: b"one".to_vec(),
+                }),
+                TerminalOutputCursorItem::Event(TerminalOutputEvent {
+                    sequence: 2,
+                    bytes: b"two".to_vec(),
+                }),
+            ]
         );
     }
 

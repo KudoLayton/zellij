@@ -83,7 +83,7 @@ use crate::{
     pty_writer::PtyWriteInstruction,
     tab::{SuppressedPanes, Tab},
     terminal_bytes::TerminalOutput,
-    terminal_output::TerminalOutputStore,
+    terminal_output::{TerminalOutputCursor, TerminalOutputCursorItem, TerminalOutputStore},
     thread_bus::Bus,
     ui::loading_indication::LoadingIndication,
     ClientId, ServerInstruction,
@@ -876,12 +876,12 @@ pub enum ScreenInstruction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TerminalOutputCursor {
+struct TerminalOutputGenerationCursor {
     generation: u64,
     last_sequence: Option<u64>,
 }
 
-impl TerminalOutputCursor {
+impl TerminalOutputGenerationCursor {
     fn accepts(&mut self, generation: u64, sequence: Option<u64>) -> bool {
         if generation < self.generation {
             return false;
@@ -906,7 +906,7 @@ impl TerminalOutputCursor {
 }
 
 fn accept_terminal_output(
-    cursors: &mut HashMap<u32, TerminalOutputCursor>,
+    cursors: &mut HashMap<u32, TerminalOutputGenerationCursor>,
     output: &TerminalOutput,
 ) -> bool {
     let Some(generation) = output.generation else {
@@ -917,7 +917,7 @@ fn accept_terminal_output(
         None => {
             cursors.insert(
                 output.terminal_id,
-                TerminalOutputCursor {
+                TerminalOutputGenerationCursor {
                     generation,
                     last_sequence: output.sequence,
                 },
@@ -1407,6 +1407,7 @@ impl WatcherState {
 struct PaneRenderSubscription {
     pane_ids: HashSet<zellij_utils::data::PaneId>,
     previous_viewports: HashMap<zellij_utils::data::PaneId, Vec<String>>,
+    terminal_output_cursors: HashMap<u32, TerminalOutputCursor>,
     ansi: bool,
 }
 
@@ -1477,7 +1478,7 @@ pub(crate) struct Screen {
     web_server_port: u16,
     render_blocker: RenderBlocker,
     watcher_clients: HashMap<ClientId, WatcherState>,
-    terminal_output_generations: HashMap<u32, TerminalOutputCursor>,
+    terminal_output_generations: HashMap<u32, TerminalOutputGenerationCursor>,
     terminal_output_store: TerminalOutputStore,
     followed_client_id: Option<ClientId>,
     cached_layouts: Vec<LayoutInfo>,
@@ -5486,11 +5487,22 @@ impl Screen {
         }
 
         if !valid_pane_ids.is_empty() {
+            let terminal_output_cursors = valid_pane_ids
+                .iter()
+                .filter_map(|pane_id| match pane_id {
+                    zellij_utils::data::PaneId::Terminal(terminal_id) => Some((
+                        *terminal_id,
+                        self.terminal_output_store.cursor_from_now(*terminal_id),
+                    )),
+                    zellij_utils::data::PaneId::Plugin(_) => None,
+                })
+                .collect();
             self.pane_render_subscribers.insert(
                 subscriber_client_id,
                 PaneRenderSubscription {
                     pane_ids: valid_pane_ids,
                     previous_viewports,
+                    terminal_output_cursors,
                     ansi,
                 },
             );
@@ -5546,7 +5558,7 @@ impl Screen {
         let mut updates_to_send: Vec<(ClientId, ServerToClientMsg)> = Vec::new();
         let mut dead_subscribers: Vec<ClientId> = Vec::new();
 
-        for (subscriber_id, subscription) in &self.pane_render_subscribers {
+        for (subscriber_id, subscription) in &mut self.pane_render_subscribers {
             let effective_map = if subscription.ansi {
                 ansi_pane_map.unwrap_or(pane_map)
             } else {
@@ -5555,10 +5567,23 @@ impl Screen {
 
             for pane_id in &subscription.pane_ids {
                 if let Some(contents) = effective_map.get(pane_id) {
+                    let terminal_output_gap = match pane_id {
+                        zellij_utils::data::PaneId::Terminal(terminal_id) => subscription
+                            .terminal_output_cursors
+                            .get_mut(terminal_id)
+                            .map(|cursor| {
+                                self.terminal_output_store
+                                    .drain_cursor(*terminal_id, cursor, 1024)
+                                    .into_iter()
+                                    .any(|item| matches!(item, TerminalOutputCursorItem::Gap(_)))
+                            })
+                            .unwrap_or(false),
+                        zellij_utils::data::PaneId::Plugin(_) => false,
+                    };
                     let changed = subscription
                         .previous_viewports
                         .get(pane_id)
-                        .map(|prev| prev != &contents.viewport)
+                        .map(|prev| prev != &contents.viewport || terminal_output_gap)
                         .unwrap_or(true);
 
                     if changed {

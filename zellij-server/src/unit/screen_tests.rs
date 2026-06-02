@@ -48,6 +48,20 @@ fn pty_bytes(terminal_id: u32, bytes: Vec<u8>) -> ScreenInstruction {
     ScreenInstruction::PtyBytes(TerminalOutput::unguarded(terminal_id, bytes))
 }
 
+fn guarded_pty_bytes(
+    terminal_id: u32,
+    bytes: Vec<u8>,
+    generation: u64,
+    sequence: u64,
+) -> ScreenInstruction {
+    ScreenInstruction::PtyBytes(TerminalOutput::guarded(
+        terminal_id,
+        bytes,
+        generation,
+        sequence,
+    ))
+}
+
 use crate::panes::grid::Grid;
 use crate::panes::link_handler::LinkHandler;
 use crate::panes::sixel::SixelImageStore;
@@ -6318,6 +6332,134 @@ fn integration_subscriber_survives_after_regular_client_detach() {
     assert!(
         has_after_detach,
         "Subscriber should receive updates after regular client detach. Messages: {:?}",
+        subscriber_msgs
+    );
+}
+
+#[test]
+fn integration_pane_render_subscriber_refreshes_after_terminal_output_gap() {
+    let size = Size { cols: 80, rows: 20 };
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.drop_all_pty_messages();
+    let screen_thread = mock_screen.run(None, vec![]);
+
+    let server_receiver = mock_screen.server_receiver.take().unwrap();
+    let received_server_instructions = Arc::new(Mutex::new(vec![]));
+    let server_thread = log_actions_in_thread!(
+        received_server_instructions,
+        ServerInstruction::KillSession,
+        server_receiver
+    );
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::SubscribeToPaneRenders {
+            client_id: 100,
+            pane_ids: vec![zellij_utils::data::PaneId::Terminal(0)],
+            scrollback: None,
+            ansi: false,
+        });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let _ = mock_screen.to_screen.send(guarded_pty_bytes(
+        0,
+        b"\x1b]0;gap without viewport change\x07".to_vec(),
+        1,
+        100,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![server_thread, plugin_thread, screen_thread]);
+
+    let msgs = mock_screen
+        .os_input
+        .server_to_client_messages
+        .lock()
+        .unwrap();
+    let subscriber_msgs = msgs.get(&100).unwrap_or(&vec![]).clone();
+
+    let update_count = subscriber_msgs
+        .iter()
+        .filter(|message| matches!(message, ServerToClientMsg::PaneRenderUpdate { .. }))
+        .count();
+    assert!(
+        update_count >= 2,
+        "subscriber should receive initial render and a gap recovery refresh; messages: {:?}",
+        subscriber_msgs
+    );
+}
+
+#[test]
+fn integration_stale_generation_output_does_not_force_subscriber_refresh() {
+    let size = Size { cols: 80, rows: 20 };
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.drop_all_pty_messages();
+    let screen_thread = mock_screen.run(None, vec![]);
+
+    let server_receiver = mock_screen.server_receiver.take().unwrap();
+    let received_server_instructions = Arc::new(Mutex::new(vec![]));
+    let server_thread = log_actions_in_thread!(
+        received_server_instructions,
+        ServerInstruction::KillSession,
+        server_receiver
+    );
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::SubscribeToPaneRenders {
+            client_id: 100,
+            pane_ids: vec![zellij_utils::data::PaneId::Terminal(0)],
+            scrollback: None,
+            ansi: false,
+        });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let _ = mock_screen.to_screen.send(guarded_pty_bytes(
+        0,
+        b"\x1b]0;fresh title\x07".to_vec(),
+        2,
+        0,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let _ = mock_screen.to_screen.send(guarded_pty_bytes(
+        0,
+        b"\x1b]0;stale title\x07".to_vec(),
+        1,
+        100,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![server_thread, plugin_thread, screen_thread]);
+
+    let msgs = mock_screen
+        .os_input
+        .server_to_client_messages
+        .lock()
+        .unwrap();
+    let subscriber_msgs = msgs.get(&100).unwrap_or(&vec![]).clone();
+
+    let update_count = subscriber_msgs
+        .iter()
+        .filter(|message| matches!(message, ServerToClientMsg::PaneRenderUpdate { .. }))
+        .count();
+    assert_eq!(
+        update_count, 1,
+        "stale generation title output should not force a subscriber refresh; messages: {:?}",
         subscriber_msgs
     );
 }
