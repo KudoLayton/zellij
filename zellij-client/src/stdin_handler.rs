@@ -8,6 +8,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use zellij_utils::{
     channels::SenderWithContext,
+    input_trace,
     vendored::termwiz::input::{InputEvent, InputParser},
 };
 
@@ -31,6 +32,21 @@ pub(crate) fn stdin_loop(
     //    termwiz byte parser (same as Unix) which understands ESC-prefixed ALT.
     #[cfg(windows)]
     let use_vt_reader = std::env::var("TERM").is_ok() && enable_vt_input();
+    if input_trace::enabled() {
+        #[cfg(windows)]
+        log::info!(
+            "INPUT_TRACE stdin_loop_start windows=true term={:?} use_vt_reader={} kitty_disabled={}",
+            std::env::var("TERM").ok(),
+            use_vt_reader,
+            explicitly_disable_kitty_keyboard_protocol,
+        );
+        #[cfg(not(windows))]
+        log::info!(
+            "INPUT_TRACE stdin_loop_start windows=false term={:?} kitty_disabled={}",
+            std::env::var("TERM").ok(),
+            explicitly_disable_kitty_keyboard_protocol,
+        );
+    }
 
     // Send the startup host query string so the host terminal replies
     // with its live pixel dimensions, fg/bg, sync-output support, and
@@ -60,6 +76,7 @@ pub(crate) fn stdin_loop(
         crate::stdin_handler_windows::native_console_stdin_loop(
             send_input_instructions,
             resize_sender,
+            explicitly_disable_kitty_keyboard_protocol,
         );
         return;
     }
@@ -110,6 +127,12 @@ pub(crate) fn stdin_loop(
             Ok(result) => {
                 match result {
                     Ok(buf) => {
+                        if input_trace::enabled() {
+                            log::info!(
+                                "INPUT_TRACE stdin_read raw={}",
+                                input_trace::format_bytes(&buf)
+                            );
+                        }
                         // Strip + classify any host-reply sequences
                         // continuously. The residue is the byte stream
                         // the keyboard parser should see.
@@ -117,6 +140,24 @@ pub(crate) fn stdin_loop(
                             let mut p = stdin_ansi_parser.lock().unwrap();
                             p.feed(&buf)
                         };
+                        if input_trace::enabled() {
+                            log::info!(
+                                "INPUT_TRACE ansi_parser replies={} completed_forward={} desktop_notifications={} partial={} residue={}",
+                                parse_output.replies.len(),
+                                parse_output
+                                    .completed_forward
+                                    .as_ref()
+                                    .map(|(token, bytes)| format!(
+                                        "token:{} bytes:{}",
+                                        token,
+                                        input_trace::format_bytes(bytes)
+                                    ))
+                                    .unwrap_or_else(|| "none".to_owned()),
+                                parse_output.desktop_notifications.len(),
+                                parse_output.has_partial_state,
+                                input_trace::format_bytes(&parse_output.residue),
+                            );
+                        }
                         if !parse_output.replies.is_empty() {
                             let _ = send_input_instructions.send(
                                 InputInstruction::AnsiStdinInstructions(parse_output.replies),
@@ -137,6 +178,13 @@ pub(crate) fn stdin_loop(
                         let has_partial = parse_output.has_partial_state;
                         let residue = parse_output.residue;
                         if residue.is_empty() {
+                            if input_trace::enabled() {
+                                log::info!(
+                                    "INPUT_TRACE stdin_residue_empty partial={} schedule_finalize={}",
+                                    has_partial,
+                                    has_partial,
+                                );
+                            }
                             // If all bytes were consumed by the host-reply
                             // parser, nothing to feed to the keyboard
                             // parser. But if the host-reply parser is
@@ -161,6 +209,13 @@ pub(crate) fn stdin_loop(
                             // continuation completes the sequence.
                             match kitty_parser.feed(&residue) {
                                 KittyParseOutcome::Complete(key_with_modifier) => {
+                                    if input_trace::enabled() {
+                                        log::info!(
+                                            "INPUT_TRACE kitty_parser outcome=Complete key={:?} raw={}",
+                                            key_with_modifier,
+                                            input_trace::format_bytes(&current_buffer),
+                                        );
+                                    }
                                     send_input_instructions
                                         .send(InputInstruction::KeyWithModifierEvent(
                                             key_with_modifier,
@@ -170,7 +225,22 @@ pub(crate) fn stdin_loop(
                                         .unwrap();
                                     continue;
                                 },
-                                KittyParseOutcome::Incomplete | KittyParseOutcome::NoMatch => {},
+                                KittyParseOutcome::Incomplete => {
+                                    if input_trace::enabled() {
+                                        log::info!(
+                                            "INPUT_TRACE kitty_parser outcome=Incomplete residue={}",
+                                            input_trace::format_bytes(&residue),
+                                        );
+                                    }
+                                },
+                                KittyParseOutcome::NoMatch => {
+                                    if input_trace::enabled() {
+                                        log::info!(
+                                            "INPUT_TRACE kitty_parser outcome=NoMatch residue={}",
+                                            input_trace::format_bytes(&residue),
+                                        );
+                                    }
+                                },
                             }
                         }
 
@@ -187,6 +257,17 @@ pub(crate) fn stdin_loop(
                             },
                             maybe_more,
                         );
+                        if input_trace::enabled() {
+                            log::info!(
+                                "INPUT_TRACE termwiz_fallback events={} residue={} current_buffer={}",
+                                events.len(),
+                                input_trace::format_bytes(&residue),
+                                input_trace::format_bytes(&current_buffer),
+                            );
+                            for input_event in &events {
+                                log::info!("INPUT_TRACE termwiz_event event={:?}", input_event);
+                            }
+                        }
 
                         // Residue contains no OSC or whitelisted CSI
                         // reports — `StdinAnsiParser::feed` strips both
@@ -244,6 +325,12 @@ fn finalize_events(
     // path real keypress bytes take. Without this drain, a real Esc
     // press whose byte was parked under partial_osc would be lost.
     let drained = stdin_ansi_parser.lock().unwrap().finalize();
+    if input_trace::enabled() {
+        log::info!(
+            "INPUT_TRACE finalize drained={}",
+            input_trace::format_bytes(&drained)
+        );
+    }
     if !drained.is_empty() {
         current_buffer.extend_from_slice(&drained);
     }
@@ -256,6 +343,16 @@ fn finalize_events(
         },
         false,
     );
+    if input_trace::enabled() {
+        log::info!(
+            "INPUT_TRACE finalize_termwiz events={} current_buffer={}",
+            events.len(),
+            input_trace::format_bytes(current_buffer),
+        );
+        for input_event in &events {
+            log::info!("INPUT_TRACE finalize_termwiz_event event={:?}", input_event);
+        }
+    }
     // Residue contains no OSC or whitelisted CSI reports — every
     // termwiz event drained on idle is a key/mouse/paste/etc.
     for input_event in events {

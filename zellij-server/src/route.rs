@@ -28,6 +28,7 @@ use zellij_utils::{
         actions::{Action, SearchDirection, SearchOption},
         command::TerminalAction,
     },
+    input_trace,
     ipc::{ClientToServerMsg, ExitReason, IpcReceiverWithContext, ServerToClientMsg},
 };
 
@@ -2233,6 +2234,9 @@ pub(crate) fn route_thread_main(
                                 session_data.read().unwrap().as_ref().and_then(|s| {
                                     let (kb, im, dim) =
                                         s.get_client_keybinds_and_mode(&client_id)?;
+                                    let trace_input = input_trace::enabled();
+                                    let raw_bytes_for_trace = trace_input
+                                        .then(|| input_trace::format_bytes(&raw_bytes));
                                     let actions: Vec<Action> = kb
                                         .get_actions_for_key_in_mode_or_default_action(
                                             im,
@@ -2241,6 +2245,18 @@ pub(crate) fn route_thread_main(
                                             dim,
                                             is_kitty_keyboard_protocol,
                                         );
+                                    if trace_input {
+                                        log::info!(
+                                            "INPUT_TRACE server_key client_id={} mode={:?} default_mode={:?} key={:?} is_kitty={} raw={} actions={:?}",
+                                            client_id,
+                                            im,
+                                            dim,
+                                            key,
+                                            is_kitty_keyboard_protocol,
+                                            raw_bytes_for_trace.unwrap_or_default(),
+                                            actions,
+                                        );
+                                    }
                                     Some((
                                         s.senders.clone(),
                                         s.default_shell.clone(),

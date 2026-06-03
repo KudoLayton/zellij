@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -7,10 +8,16 @@ use windows_sys::Win32::System::Console::{
     ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_WINDOW_INPUT, STD_INPUT_HANDLE,
 };
 
+use crate::keyboard_parser::{KittyKeyboardParser, KittyParseOutcome};
 use crate::InputInstruction;
 use zellij_utils::channels::SenderWithContext;
+use zellij_utils::data::{BareKey, KeyWithModifier};
 use zellij_utils::input::{cast_crossterm_key, from_crossterm_mouse};
+use zellij_utils::input_trace;
 use zellij_utils::vendored::termwiz::input::InputEvent;
+
+const NATIVE_KITTY_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(30);
+const NATIVE_KITTY_SEQUENCE_MAX_LEN: usize = 32;
 
 /// Saved console input mode from before `enable_vt_input()` modified it.
 /// Used by `restore_vt_input()` to put the console back the way the shell
@@ -94,23 +101,69 @@ pub(crate) fn restore_vt_input() {
 pub(crate) fn native_console_stdin_loop(
     send_input_instructions: SenderWithContext<InputInstruction>,
     resize_sender: Option<std::sync::mpsc::Sender<()>>,
+    explicitly_disable_kitty_keyboard_protocol: bool,
 ) {
+    let mut kitty_sequence_buffer =
+        NativeKittySequenceBuffer::new(!explicitly_disable_kitty_keyboard_protocol);
     loop {
+        if kitty_sequence_buffer.has_pending() {
+            match event::poll(NATIVE_KITTY_SEQUENCE_TIMEOUT) {
+                Ok(true) => {},
+                Ok(false) => {
+                    if send_key_dispatches(
+                        &send_input_instructions,
+                        kitty_sequence_buffer.flush_pending("timeout"),
+                    ) {
+                        break;
+                    }
+                    continue;
+                },
+                Err(e) => {
+                    log::error!("Failed to poll crossterm event: {}", e);
+                    let _ = send_input_instructions.send(InputInstruction::Exit);
+                    break;
+                },
+            }
+        }
         match event::read() {
             Ok(Event::Key(key_event)) => {
+                if input_trace::enabled() {
+                    log::info!("INPUT_TRACE native_console_key raw_event={:?}", key_event);
+                }
                 if key_event.kind != KeyEventKind::Press {
                     continue;
                 }
                 if let Some((key, bytes)) = cast_crossterm_key(key_event) {
-                    if send_input_instructions
-                        .send(InputInstruction::KeyWithModifierEvent(key, bytes, false))
-                        .is_err()
-                    {
+                    if input_trace::enabled() {
+                        log::info!(
+                            "INPUT_TRACE native_console_cast key={:?} raw={}",
+                            key,
+                            input_trace::format_bytes(&bytes),
+                        );
+                    }
+                    let dispatches = kitty_sequence_buffer.push(key, bytes);
+                    if send_key_dispatches(&send_input_instructions, dispatches) {
                         break;
+                    }
+                } else {
+                    if send_key_dispatches(
+                        &send_input_instructions,
+                        kitty_sequence_buffer.flush_pending("uncast_key_event"),
+                    ) {
+                        break;
+                    }
+                    if input_trace::enabled() {
+                        log::info!("INPUT_TRACE native_console_cast skipped=true");
                     }
                 }
             },
             Ok(Event::Mouse(mouse_event)) => {
+                if send_key_dispatches(
+                    &send_input_instructions,
+                    kitty_sequence_buffer.flush_pending("non_key_event"),
+                ) {
+                    break;
+                }
                 let mouse_event = from_crossterm_mouse(mouse_event);
                 if send_input_instructions
                     .send(InputInstruction::MouseEvent(mouse_event))
@@ -120,6 +173,12 @@ pub(crate) fn native_console_stdin_loop(
                 }
             },
             Ok(Event::Paste(text)) => {
+                if send_key_dispatches(
+                    &send_input_instructions,
+                    kitty_sequence_buffer.flush_pending("non_key_event"),
+                ) {
+                    break;
+                }
                 let raw_bytes = text.as_bytes().to_vec();
                 let paste_event = InputEvent::Paste(text);
                 if send_input_instructions
@@ -130,6 +189,12 @@ pub(crate) fn native_console_stdin_loop(
                 }
             },
             Ok(Event::Resize(..)) => {
+                if send_key_dispatches(
+                    &send_input_instructions,
+                    kitty_sequence_buffer.flush_pending("non_key_event"),
+                ) {
+                    break;
+                }
                 if let Some(ref tx) = resize_sender {
                     let _ = tx.send(());
                 }
@@ -141,5 +206,266 @@ pub(crate) fn native_console_stdin_loop(
                 break;
             },
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeKeyDispatch {
+    key: KeyWithModifier,
+    raw_bytes: Vec<u8>,
+    is_kitty_keyboard_protocol: bool,
+}
+
+struct NativeKittySequenceBuffer {
+    enabled: bool,
+    pending: Vec<(KeyWithModifier, Vec<u8>)>,
+}
+
+impl NativeKittySequenceBuffer {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            pending: Vec::new(),
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    fn push(&mut self, key: KeyWithModifier, raw_bytes: Vec<u8>) -> Vec<NativeKeyDispatch> {
+        if !self.enabled {
+            return vec![native_dispatch(key, raw_bytes)];
+        }
+
+        if self.pending.is_empty() {
+            if is_native_kitty_sequence_start(&key, &raw_bytes) {
+                self.pending.push((key, raw_bytes));
+                return Vec::new();
+            }
+            return vec![native_dispatch(key, raw_bytes)];
+        }
+
+        if !is_native_kitty_sequence_continuation(&raw_bytes, self.pending.len()) {
+            let mut dispatches = self.flush_pending("invalid_continuation");
+            dispatches.push(native_dispatch(key, raw_bytes));
+            return dispatches;
+        }
+
+        self.pending.push((key, raw_bytes));
+        let sequence = self.pending_raw_bytes();
+        if sequence.len() > NATIVE_KITTY_SEQUENCE_MAX_LEN {
+            return self.flush_pending("too_long");
+        }
+        if !is_native_kitty_sequence_complete(&sequence) {
+            return Vec::new();
+        }
+
+        let mut normalized = vec![0x1b];
+        normalized.extend_from_slice(&sequence);
+        match KittyKeyboardParser::new().feed(&normalized) {
+            KittyParseOutcome::Complete(key) => {
+                self.pending.clear();
+                if input_trace::enabled() {
+                    log::info!(
+                        "INPUT_TRACE native_console_kitty_sequence outcome=Complete key={:?} raw={}",
+                        key,
+                        input_trace::format_bytes(&normalized),
+                    );
+                }
+                vec![NativeKeyDispatch {
+                    key,
+                    raw_bytes: normalized,
+                    is_kitty_keyboard_protocol: true,
+                }]
+            },
+            KittyParseOutcome::Incomplete => Vec::new(),
+            KittyParseOutcome::NoMatch => self.flush_pending("nomatch"),
+        }
+    }
+
+    fn flush_pending(&mut self, reason: &'static str) -> Vec<NativeKeyDispatch> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        if input_trace::enabled() {
+            log::info!(
+                "INPUT_TRACE native_console_kitty_sequence outcome=Flush reason={} raw={}",
+                reason,
+                input_trace::format_bytes(&self.pending_raw_bytes()),
+            );
+        }
+        self.pending
+            .drain(..)
+            .map(|(key, raw_bytes)| native_dispatch(key, raw_bytes))
+            .collect()
+    }
+
+    fn pending_raw_bytes(&self) -> Vec<u8> {
+        self.pending
+            .iter()
+            .flat_map(|(_, raw_bytes)| raw_bytes.iter().copied())
+            .collect()
+    }
+}
+
+fn native_dispatch(key: KeyWithModifier, raw_bytes: Vec<u8>) -> NativeKeyDispatch {
+    NativeKeyDispatch {
+        key,
+        raw_bytes,
+        is_kitty_keyboard_protocol: false,
+    }
+}
+
+fn is_native_kitty_sequence_start(key: &KeyWithModifier, raw_bytes: &[u8]) -> bool {
+    raw_bytes == b"[" && key.bare_key == BareKey::Char('[') && key.key_modifiers.is_empty()
+}
+
+fn is_native_kitty_sequence_continuation(raw_bytes: &[u8], pending_len: usize) -> bool {
+    let [byte] = raw_bytes else {
+        return false;
+    };
+    match *byte {
+        b'0'..=b'9' => true,
+        b';' => pending_len > 1,
+        b'u' | b'~' => pending_len > 1,
+        b'A'..=b'Z' => pending_len > 1,
+        _ => false,
+    }
+}
+
+fn is_native_kitty_sequence_complete(bytes: &[u8]) -> bool {
+    matches!(bytes.last(), Some(b'u' | b'~' | b'A'..=b'Z'))
+}
+
+fn send_key_dispatches(
+    send_input_instructions: &SenderWithContext<InputInstruction>,
+    dispatches: Vec<NativeKeyDispatch>,
+) -> bool {
+    for dispatch in dispatches {
+        if send_input_instructions
+            .send(InputInstruction::KeyWithModifierEvent(
+                dispatch.key,
+                dispatch.raw_bytes,
+                dispatch.is_kitty_keyboard_protocol,
+            ))
+            .is_err()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod native_kitty_sequence_tests {
+    use super::*;
+    use zellij_utils::data::KeyModifier;
+
+    fn key(c: char) -> KeyWithModifier {
+        KeyWithModifier::new(BareKey::Char(c))
+    }
+
+    fn push_char(buffer: &mut NativeKittySequenceBuffer, c: char) -> Vec<NativeKeyDispatch> {
+        buffer.push(key(c), c.to_string().into_bytes())
+    }
+
+    #[test]
+    fn ctrl_dot_csi_u_sequence_emits_one_kitty_key() {
+        let mut buffer = NativeKittySequenceBuffer::new(true);
+        let mut dispatches = Vec::new();
+        for c in "[46;5u".chars() {
+            dispatches.extend(push_char(&mut buffer, c));
+        }
+
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(
+            dispatches[0].key,
+            KeyWithModifier::new(BareKey::Char('.')).with_ctrl_modifier()
+        );
+        assert_eq!(dispatches[0].raw_bytes, b"\x1b[46;5u".to_vec());
+        assert!(dispatches[0].is_kitty_keyboard_protocol);
+    }
+
+    #[test]
+    fn ctrl_q_csi_u_sequence_emits_one_kitty_key() {
+        let mut buffer = NativeKittySequenceBuffer::new(true);
+        let mut dispatches = Vec::new();
+        for c in "[113;5u".chars() {
+            dispatches.extend(push_char(&mut buffer, c));
+        }
+
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(
+            dispatches[0].key,
+            KeyWithModifier::new(BareKey::Char('q')).with_ctrl_modifier()
+        );
+        assert_eq!(dispatches[0].raw_bytes, b"\x1b[113;5u".to_vec());
+        assert!(dispatches[0].is_kitty_keyboard_protocol);
+    }
+
+    #[test]
+    fn regular_character_dispatches_immediately() {
+        let mut buffer = NativeKittySequenceBuffer::new(true);
+
+        let dispatches = push_char(&mut buffer, 'a');
+
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].key, key('a'));
+        assert_eq!(dispatches[0].raw_bytes, b"a".to_vec());
+        assert!(!dispatches[0].is_kitty_keyboard_protocol);
+        assert!(!buffer.has_pending());
+    }
+
+    #[test]
+    fn literal_open_bracket_flushes_as_regular_key() {
+        let mut buffer = NativeKittySequenceBuffer::new(true);
+
+        assert!(push_char(&mut buffer, '[').is_empty());
+        let dispatches = buffer.flush_pending("test");
+
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].key, key('['));
+        assert_eq!(dispatches[0].raw_bytes, b"[".to_vec());
+        assert!(!dispatches[0].is_kitty_keyboard_protocol);
+    }
+
+    #[test]
+    fn malformed_sequence_preserves_original_order() {
+        let mut buffer = NativeKittySequenceBuffer::new(true);
+
+        assert!(push_char(&mut buffer, '[').is_empty());
+        let dispatches = push_char(&mut buffer, 'x');
+
+        assert_eq!(dispatches.len(), 2);
+        assert_eq!(dispatches[0].key, key('['));
+        assert_eq!(dispatches[0].raw_bytes, b"[".to_vec());
+        assert_eq!(dispatches[1].key, key('x'));
+        assert_eq!(dispatches[1].raw_bytes, b"x".to_vec());
+        assert!(dispatches.iter().all(|d| !d.is_kitty_keyboard_protocol));
+    }
+
+    #[test]
+    fn disabled_buffer_dispatches_sequence_characters_normally() {
+        let mut buffer = NativeKittySequenceBuffer::new(false);
+
+        let dispatches = push_char(&mut buffer, '[');
+
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].key, key('['));
+        assert_eq!(dispatches[0].raw_bytes, b"[".to_vec());
+        assert!(!dispatches[0].is_kitty_keyboard_protocol);
+        assert!(!buffer.has_pending());
+    }
+
+    #[test]
+    fn restored_ctrl_modifier_does_not_depend_on_crossterm_modifier_flags() {
+        let mut buffer = NativeKittySequenceBuffer::new(true);
+        let mut dispatches = Vec::new();
+        for c in "[46;5u".chars() {
+            dispatches.extend(push_char(&mut buffer, c));
+        }
+
+        assert!(dispatches[0].key.key_modifiers.contains(&KeyModifier::Ctrl));
     }
 }

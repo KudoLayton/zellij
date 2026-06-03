@@ -10,6 +10,7 @@ mod home_unix;
 #[cfg(windows)]
 mod home_windows;
 pub mod input;
+pub mod input_trace;
 pub mod kdl;
 pub mod pane_size;
 pub mod plugin_api;

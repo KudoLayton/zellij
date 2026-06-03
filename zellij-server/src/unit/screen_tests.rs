@@ -5645,6 +5645,63 @@ fn subscriber_removed_on_remove_client() {
 }
 
 #[test]
+fn remove_client_is_nonfatal_when_background_jobs_sender_is_closed() {
+    let size = Size { cols: 80, rows: 20 };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+
+    let (to_background_jobs, background_jobs_receiver): ChannelWithContext<BackgroundJob> =
+        channels::unbounded();
+    let to_background_jobs = SenderWithContext::new(to_background_jobs);
+    drop(background_jobs_receiver);
+
+    let (to_plugin, _plugin_receiver): ChannelWithContext<PluginInstruction> =
+        channels::unbounded();
+    let to_plugin = SenderWithContext::new(to_plugin);
+
+    screen.bus.senders.to_background_jobs = Some(to_background_jobs);
+    screen.bus.senders.to_plugin = Some(to_plugin);
+    screen.bus.senders.should_silently_fail = false;
+
+    let result = screen.remove_client(1);
+
+    assert!(
+        result.is_ok(),
+        "remove_client should tolerate a closed background jobs sender during teardown: {result:?}"
+    );
+    assert!(!screen.connected_clients.borrow().contains_key(&1));
+    assert!(!screen.client_sizes.contains_key(&1));
+}
+
+#[test]
+fn remove_client_is_nonfatal_when_plugin_sender_is_closed() {
+    let size = Size { cols: 80, rows: 20 };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+
+    let (to_background_jobs, _background_jobs_receiver): ChannelWithContext<BackgroundJob> =
+        channels::unbounded();
+    let to_background_jobs = SenderWithContext::new(to_background_jobs);
+
+    let (to_plugin, plugin_receiver): ChannelWithContext<PluginInstruction> = channels::unbounded();
+    let to_plugin = SenderWithContext::new(to_plugin);
+    drop(plugin_receiver);
+
+    screen.bus.senders.to_background_jobs = Some(to_background_jobs);
+    screen.bus.senders.to_plugin = Some(to_plugin);
+    screen.bus.senders.should_silently_fail = false;
+
+    let result = screen.remove_client(1);
+
+    assert!(
+        result.is_ok(),
+        "remove_client should tolerate a closed plugin sender during teardown: {result:?}"
+    );
+    assert!(!screen.connected_clients.borrow().contains_key(&1));
+    assert!(!screen.client_sizes.contains_key(&1));
+}
+
+#[test]
 fn subscriber_removed_when_all_panes_closed() {
     let size = Size { cols: 80, rows: 20 };
     let (mut screen, messages) = create_new_screen_with_message_capture(size);

@@ -3242,7 +3242,7 @@ impl Screen {
             self.recompute_tab_size(prev_tab_id)
                 .with_context(err_context)?;
         }
-        self.log_and_report_session_state()
+        self.log_and_report_session_state_best_effort()
             .with_context(err_context)
     }
 
@@ -3278,7 +3278,10 @@ impl Screen {
         }
     }
 
-    pub fn generate_and_report_tab_state(&mut self) -> Result<Vec<TabInfo>> {
+    pub fn generate_and_report_tab_state(
+        &mut self,
+        best_effort_sends: bool,
+    ) -> Result<Vec<TabInfo>> {
         let mut plugin_updates = vec![];
         let mut tab_infos_for_screen_state = BTreeMap::new();
         for tab in self.tabs.values() {
@@ -3372,13 +3375,14 @@ impl Screen {
                 ));
             }
         }
-        self.bus
-            .senders
-            .send_to_plugin(PluginInstruction::Update(plugin_updates))
-            .context("failed to update tabs")?;
+        self.send_to_plugin_for_session_report(
+            PluginInstruction::Update(plugin_updates),
+            best_effort_sends,
+            "failed to update tabs",
+        )?;
         Ok(tab_infos_for_screen_state.values().cloned().collect())
     }
-    fn generate_and_report_pane_state(&mut self) -> Result<PaneManifest> {
+    fn generate_and_report_pane_state(&mut self, best_effort_sends: bool) -> Result<PaneManifest> {
         let mut pane_manifest = PaneManifest::default();
         for tab in self.tabs.values() {
             pane_manifest.panes.insert(tab.position, tab.pane_infos());
@@ -3396,10 +3400,11 @@ impl Screen {
             }
         }
         if !plugin_updates.is_empty() {
-            self.bus
-                .senders
-                .send_to_plugin(PluginInstruction::Update(plugin_updates))
-                .context("failed to update pane state")?;
+            self.send_to_plugin_for_session_report(
+                PluginInstruction::Update(plugin_updates),
+                best_effort_sends,
+                "failed to update pane state",
+            )?;
         }
 
         Ok(pane_manifest)
@@ -3464,12 +3469,20 @@ impl Screen {
     }
 
     fn log_and_report_session_state(&mut self) -> Result<()> {
+        self.log_and_report_session_state_inner(false)
+    }
+
+    fn log_and_report_session_state_best_effort(&mut self) -> Result<()> {
+        self.log_and_report_session_state_inner(true)
+    }
+
+    fn log_and_report_session_state_inner(&mut self, best_effort_sends: bool) -> Result<()> {
         let err_context = || format!("Failed to log and report session state");
 
         self.update_active_pane_ids();
         // generate own session info
-        let pane_manifest = self.generate_and_report_pane_state()?;
-        let tab_infos = self.generate_and_report_tab_state()?;
+        let pane_manifest = self.generate_and_report_pane_state(best_effort_sends)?;
+        let tab_infos = self.generate_and_report_tab_state(best_effort_sends)?;
 
         // Lazy-load layouts on first call if cache is empty
         // After that, cache is updated by watcher via UpdateAvailableLayouts instruction
@@ -3522,13 +3535,12 @@ impl Screen {
                 .collect(),
             creation_time,
         };
-        self.bus
-            .senders
-            .send_to_background_jobs(BackgroundJob::ReportSessionInfo(
-                self.session_name.to_owned(),
-                session_info.clone(),
-            ))
-            .with_context(err_context)?;
+        self.send_to_background_jobs_for_session_report(
+            BackgroundJob::ReportSessionInfo(self.session_name.to_owned(), session_info.clone()),
+            best_effort_sends,
+            "failed to report session info",
+        )
+        .with_context(err_context)?;
 
         self.peer_sessions_cache
             .insert(self.session_name.clone(), session_info);
@@ -3542,20 +3554,72 @@ impl Screen {
             .iter()
             .map(|(n, d)| (n.clone(), *d))
             .collect();
-        self.bus
-            .senders
-            .send_to_plugin(PluginInstruction::Update(vec![(
+        self.send_to_plugin_for_session_report(
+            PluginInstruction::Update(vec![(
                 None,
                 None,
                 Event::SessionUpdate(live_sessions, resurrectable_sessions),
-            )]))
-            .with_context(err_context)?;
+            )]),
+            best_effort_sends,
+            "failed to update session state plugins",
+        )
+        .with_context(err_context)?;
 
-        self.bus
-            .senders
-            .send_to_background_jobs(BackgroundJob::QueryZellijWebServerStatus)
-            .with_context(err_context)?;
+        self.send_to_background_jobs_for_session_report(
+            BackgroundJob::QueryZellijWebServerStatus,
+            best_effort_sends,
+            "failed to query web server status",
+        )
+        .with_context(err_context)?;
         Ok(())
+    }
+
+    fn send_to_plugin_for_session_report(
+        &self,
+        instruction: PluginInstruction,
+        best_effort_sends: bool,
+        context: &'static str,
+    ) -> Result<()> {
+        match self
+            .bus
+            .senders
+            .send_to_plugin(instruction)
+            .context(context)
+        {
+            Ok(()) => Ok(()),
+            Err(e) if best_effort_sends => {
+                log::warn!(
+                    "Ignoring late session-state plugin send failure during client removal: {:#}",
+                    e
+                );
+                Ok(())
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    fn send_to_background_jobs_for_session_report(
+        &self,
+        job: BackgroundJob,
+        best_effort_sends: bool,
+        context: &'static str,
+    ) -> Result<()> {
+        match self
+            .bus
+            .senders
+            .send_to_background_jobs(job)
+            .context(context)
+        {
+            Ok(()) => Ok(()),
+            Err(e) if best_effort_sends => {
+                log::warn!(
+                    "Ignoring late session-state background job send failure during client removal: {:#}",
+                    e
+                );
+                Ok(())
+            },
+            Err(e) => Err(e),
+        }
     }
     fn dump_layout_to_hd(&mut self) -> Result<()> {
         let err_context = || format!("Failed to log and report session state");
@@ -7608,7 +7672,6 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::RemoveClient(client_id) => {
                 screen.remove_client(client_id)?;
-                screen.log_and_report_session_state()?;
                 screen.render(None)?;
             },
             ScreenInstruction::UpdateSearch(
@@ -8758,8 +8821,8 @@ pub(crate) fn screen_thread_main(
                 let err_context = || "Failed to save session";
 
                 screen.update_active_pane_ids();
-                let pane_manifest = screen.generate_and_report_pane_state()?;
-                let tab_infos = screen.generate_and_report_tab_state()?;
+                let pane_manifest = screen.generate_and_report_pane_state(false)?;
+                let tab_infos = screen.generate_and_report_tab_state(false)?;
 
                 #[cfg(not(test))]
                 let (available_layouts, _layout_errors) = Layout::list_available_layouts(
