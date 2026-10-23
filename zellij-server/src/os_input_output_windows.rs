@@ -15,6 +15,11 @@ use std::{
 
 use tokio::net::windows::named_pipe::NamedPipeServer;
 
+#[path = "windows_input.rs"]
+mod windows_input;
+#[path = "windows_input_pipe.rs"]
+mod windows_input_pipe;
+
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
