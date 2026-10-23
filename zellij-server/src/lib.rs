@@ -1627,6 +1627,9 @@ impl SessionState {
     pub fn watcher_client_ids(&self) -> Vec<ClientId> {
         self.watchers.keys().copied().collect()
     }
+    fn client_is_connected(&self, id: ClientId) -> bool {
+        self.clients.contains_key(&id) || self.watchers.contains_key(&id)
+    }
     pub fn web_client_ids(&self) -> Vec<ClientId> {
         self.clients
             .iter()
@@ -1833,9 +1836,27 @@ mod env_sync_tests {
     }
 }
 
+fn detach_exit_reason() -> ExitReason {
+    ExitReason::NormalDetached
+}
+
 #[cfg(test)]
 mod session_state_tests {
     use super::*;
+
+    #[test]
+    fn detached_exit_and_removed_render_targets_are_distinct() {
+        assert_eq!(detach_exit_reason(), ExitReason::NormalDetached);
+        let mut state = with_client(1);
+        state.watchers.insert(2, false);
+        assert!(state.client_is_connected(1));
+        assert!(state.client_is_connected(2));
+        assert!(!state.client_is_connected(3));
+        state.remove_client(1);
+        state.remove_watcher(2);
+        assert!(!state.client_is_connected(1));
+        assert!(!state.client_is_connected(2));
+    }
 
     fn with_client(id: ClientId) -> SessionState {
         let mut s = SessionState::new();
@@ -4469,7 +4490,7 @@ pub fn start_server_impl(
                     let _ = os_input.send_to_client(
                         *client_id,
                         ServerToClientMsg::Exit {
-                            exit_reason: ExitReason::Normal,
+                            exit_reason: detach_exit_reason(),
                         },
                     );
                     remove_client!(*client_id, os_input, session_state, session_data);
@@ -4496,6 +4517,9 @@ pub fn start_server_impl(
                 // If `None`- Send an exit instruction. This is the case when a user closes the last Tab/Pane.
                 if let Some(output) = serialized_output {
                     for (client_id, client_render_instruction) in output {
+                        if !session_state.read().unwrap().client_is_connected(client_id) {
+                            continue;
+                        }
                         let msg = match client_render_instruction {
                             RenderPayload::Ansi(content) => ServerToClientMsg::Render { content },
                             RenderPayload::Frame(frame) => ServerToClientMsg::RenderFrame { frame },

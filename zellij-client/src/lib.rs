@@ -6,8 +6,10 @@ mod os_input_output_unix;
 #[cfg(windows)]
 #[path = "os_input_output_windows.rs"]
 mod os_input_output_windows;
+mod terminal_cleanup;
 #[cfg(windows)]
 mod windows_console_writer;
+use terminal_cleanup::TerminalCleanupGuard;
 
 pub mod cli_client;
 mod command_is_executing;
@@ -962,26 +964,31 @@ pub fn start_remote_client(
     let _ = stdout.flush();
     let host_contacted = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    let terminal_cleanup = TerminalCleanupGuard::default();
     std::panic::set_hook({
         use zellij_utils::errors::handle_panic;
         let os_input = os_input.clone();
+        let terminal_cleanup = terminal_cleanup.clone();
         Box::new(move |info| {
-            os_input.disable_mouse().non_fatal();
-            os_input.restore_console_mode();
-            if let Ok(()) = os_input.unset_raw_mode() {
+            terminal_cleanup.run_once(|| {
+                os_input.disable_mouse().non_fatal();
+                os_input.restore_console_mode();
+                let _ = os_input.unset_raw_mode();
                 handle_panic::<ClientInstruction>(info, None);
-            }
+            });
         })
     });
 
     let reset_controlling_terminal_state = |e: String, exit_status: i32| {
-        os_input.disable_mouse().non_fatal();
-        os_input.unset_raw_mode().unwrap();
-        os_input.restore_console_mode();
-        let error = terminal_teardown_message(&e, full_screen_ws.rows, true, false);
-        let mut stdout = os_input.get_stdout_writer();
-        stdout.write_all(error.as_bytes()).unwrap();
-        stdout.flush().unwrap();
+        terminal_cleanup.run_once(|| {
+            os_input.disable_mouse().non_fatal();
+            let _ = os_input.unset_raw_mode();
+            os_input.restore_console_mode();
+            let error = terminal_teardown_message(&e, full_screen_ws.rows, true, false);
+            let mut stdout = os_input.get_stdout_writer();
+            let _ = stdout.write_all(error.as_bytes());
+            let _ = stdout.flush();
+        });
         if exit_status == 0 {
             log::info!("{}", e);
         } else {
@@ -1309,17 +1316,20 @@ pub fn start_client(
     > = channels::bounded(50);
     let send_input_instructions = SenderWithContext::new(send_input_instructions);
 
+    let terminal_cleanup = TerminalCleanupGuard::default();
     if os_input.should_install_panic_hook() {
         std::panic::set_hook({
             use zellij_utils::errors::handle_panic;
             let send_client_instructions = send_client_instructions.clone();
             let os_input = os_input.clone();
+            let terminal_cleanup = terminal_cleanup.clone();
             Box::new(move |info| {
-                os_input.disable_mouse().non_fatal();
-                os_input.restore_console_mode();
-                if let Ok(()) = os_input.unset_raw_mode() {
+                terminal_cleanup.run_once(|| {
+                    os_input.disable_mouse().non_fatal();
+                    os_input.restore_console_mode();
+                    let _ = os_input.unset_raw_mode();
                     handle_panic(info, Some(&send_client_instructions));
-                }
+                });
             })
         });
     }
@@ -1487,18 +1497,20 @@ pub fn start_client(
         .unwrap();
 
     let handle_error = |backtrace: String, include_grapheme_cluster_exit: bool| {
-        os_input.disable_mouse().non_fatal();
-        let _ = os_input.unset_raw_mode();
-        os_input.restore_console_mode();
-        let error = terminal_teardown_message(
-            &backtrace,
-            full_screen_ws.rows,
-            !explicitly_disable_kitty_keyboard_protocol,
-            include_grapheme_cluster_exit,
-        );
-        let mut stdout = os_input.get_stdout_writer();
-        let _ = stdout.write_all(error.as_bytes());
-        let _ = stdout.flush();
+        terminal_cleanup.run_once(|| {
+            os_input.disable_mouse().non_fatal();
+            let _ = os_input.unset_raw_mode();
+            os_input.restore_console_mode();
+            let error = terminal_teardown_message(
+                &backtrace,
+                full_screen_ws.rows,
+                !explicitly_disable_kitty_keyboard_protocol,
+                include_grapheme_cluster_exit,
+            );
+            let mut stdout = os_input.get_stdout_writer();
+            let _ = stdout.write_all(error.as_bytes());
+            let _ = stdout.flush();
+        });
         std::process::exit(1);
     };
 
@@ -1743,25 +1755,27 @@ pub fn start_client(
     }
 
     if reconnect_to_session.is_none() {
-        let goodbye_message = terminal_teardown_message(
-            &exit_msg,
-            full_screen_ws.rows,
-            !explicitly_disable_kitty_keyboard_protocol,
-            outer_grapheme_cluster_mode.is_enabled(),
-        );
+        terminal_cleanup.run_once(|| {
+            let goodbye_message = terminal_teardown_message(
+                &exit_msg,
+                full_screen_ws.rows,
+                !explicitly_disable_kitty_keyboard_protocol,
+                outer_grapheme_cluster_mode.is_enabled(),
+            );
 
-        os_input.disable_mouse().non_fatal();
-        info!("{}", exit_msg);
-        let _ = os_input.unset_raw_mode();
-        os_input.restore_console_mode();
-        let mut stdout = os_input.get_stdout_writer();
-        let _ = stdout.write_all(goodbye_message.as_bytes());
-        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-            if let Some(line) = exit_line_once(&reminders) {
-                let _ = stdout.write_all(line.as_bytes());
+            os_input.disable_mouse().non_fatal();
+            info!("{}", exit_msg);
+            let _ = os_input.unset_raw_mode();
+            os_input.restore_console_mode();
+            let mut stdout = os_input.get_stdout_writer();
+            let _ = stdout.write_all(goodbye_message.as_bytes());
+            if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                if let Some(line) = exit_line_once(&reminders) {
+                    let _ = stdout.write_all(line.as_bytes());
+                }
             }
-        }
-        let _ = stdout.flush();
+            let _ = stdout.flush();
+        });
     } else {
         let clear_screen = "\u{1b}[2J";
         let mut stdout = os_input.get_stdout_writer();
