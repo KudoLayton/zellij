@@ -1,0 +1,112 @@
+# Windows stability integration
+
+Status: core integration implemented; not a fully validated release.
+
+Scope decision: the user chose to retain the current scope, record the GUI watcher/legacy PSReadLine limitations, and finish core regression/build verification without changing user profiles or modules.
+
+## Pinned sources
+
+- Upstream: c7c4ce42b8663dad464c03b92a7949ad58c68c55
+- Fork: b14c8a3ff4ca06e88a55e992dd5775b2b2cb38e8
+- rmux reference: 1f4571e74f36be0c033c6294d1616c7d3a6fbda1
+- Worktree: D:/Git/zw; branch: integration/windows-stability
+- Original main and untracked yazi.txt remain untouched.
+
+## Fork commit disposition
+
+The behavior-level dispositions below have now been implemented and checked with focused and platform library tests. Test cases are consolidated around behavior rather than retaining every old test function name. This does not imply completion of the input-stall worker or release/interactive validation.
+
+| Commits | Disposition |
+| --- | --- |
+| eb99a1f60, b56a18ff3 | Retain ConPTY flags/fallback and tests |
+| fbaaf34ed, 6067e8c16 | Rework close-after-exit for descendant lifetime; retain regression coverage |
+| 05ca3fc20, 6b495e640 | Retain Job Object ownership and process-tree tests |
+| 8c396cd4f, 7f64aad12, e96326886, ac3fff101, 8fa56a7c4 | Adapt lossless initial PowerShell DSR bootstrap and tests |
+| 73892a39b, dacff8f3a, dbb09b50e, 52270448f | Retain console Unicode writer and flush tests |
+| a84d2f31e, cdf0b21d9, ccff735ca, 5f0d771b3, e09487a06 | Adapt idempotent local/remote cleanup alongside upstream console-mode restore |
+| a7037e8d9, c31efb62c, f36193bf9 | Formatting absorbed into corresponding logical changes |
+| db3167486, 0ef551873 | Retain SIGINT through pane stdin |
+| 88b881cc5, e3ed549f2 | Retain fresh-ConPTY fallback on spawn failure |
+| f98247175, 6900e8d10, 58abc2373, a0187ee79, 46b6a5404 | Retain bounded blocking reader and real ConPTY coverage |
+| b7cc89060, baa1e1284, 3687944da, 354fec719, 1b187d8eb, aa37e8471 | Adapt generation/gap/subscriber/render protection as one feature |
+| b14c8a3ff | Upstream already has nonfatal/idempotent screen detach behavior (closed-plugin-channel test added). Preserve native modifier events and literal text rather than the old CSI-u synthesis heuristic; preserve upstream WT/VT parser. Port opt-in bounded input tracing. |
+
+## rmux candidate disposition
+
+- 15365111: adapt bounded input stall recovery; inspect latest implementation and follow-ups before porting.
+- 0eb4a30f: descendant-liveness behavior is now implemented independently using Job accounting (not rmux console enumeration). Explicit and natural descendant exit tests pass; final interaction with bounded input recovery remains pending.
+- 5084329b, 4aea4051: regression scenarios first; do not duplicate rmux input protocol.
+- 444c3b3d: the fork already handled E_HANDLE/broken-pipe resize races, but not every HRESULT. Corrected earlier duplicate classification: added ERROR_INVALID_PARAMETER HRESULT to the benign exit-race set, with a narrow policy test.
+- 28c4ba6c: not needed for the anonymous output reader. Revisited for the upcoming cancellable input writer: rmux uses a separate synchronous-read/overlapped-write named pipe, so same-user ACL, unpredictable names and local-only allocation are relevant to that input path.
+- 57b0b432 and endpoint rotation: retain interprocess IPC; regression tests rather than implementation copy.
+
+Record source attribution and license review with any rmux-derived implementation.
+
+## Implemented so far
+
+- Console output is routed through `windows_console_writer.rs` on Windows, retaining redirected byte output and incomplete UTF-8 across flushes. Existing prefix/flush tests were retained and all Korean/emoji byte boundaries are covered by an additional test.
+- `terminal_cleanup.rs` arbitrates local/remote panic, error, and normal exit cleanup. Shared guards prevent repeated/reentrant teardown; failed raw-mode restoration no longer prevents remaining best-effort cleanup. Latest upstream grapheme, reminder, nested-session, and VT behavior remains in place.
+- Four cleanup arbitration tests cover cloned guards, concurrent exits, reentrancy, and independent clients.
+- Windows backend now uses RAII-owned anonymous pipes, a bounded blocking output reader (64 x 64KiB), interruptible teardown backpressure, and lossless initial PowerShell DSR filtering across chunk/EOF/timeout boundaries. The worker drains abandoned output to avoid ClosePseudoConsole deadlock.
+- Windows build-sensitive ConPTY flags and the existing environment overrides are preserved. A failed passthrough spawn retries with a fresh console/pipes. Upstream quoting, PaneEnv overlays and window startup-handle configuration remain intact.
+- Children start suspended and are assigned to a kill-on-close Job before resuming. Job accounting keeps the pane alive after wrapper exit; natural exit waits for the output consumer to finish before delivering the exit callback. Explicit close terminates the tree and releases backpressure. This independently implements the behavior motivating rmux 0eb4a30f; no rmux source was copied.
+- SIGINT is written as ETX to the matching pane stdin, without terminating unrelated processes as fallback. Resize exit-race handling includes invalid-handle, broken-pipe and invalid-parameter HRESULTs.
+- The global terminals mutex is no longer held during I/O or console destruction. Input writes/flushes are still synchronous under a per-pane mutex: full bounded input worker/stall cancellation is NOT implemented yet.
+- Real ConPTY tests cover cmd/PowerShell output, pane environments, >4MiB output, other-pane isolation, wrapper/descendant lifetime, final-output-before-exit ordering, explicit close and failed spawn. A separate 5MiB anonymous-pipe test verifies exact byte preservation because ConPTY can legitimately repeat its final screen frame.
+- Common PTY output now carries an invalidatable generation token and sequence through screen delivery and pending-pane queues. All four reader launch paths share one start/stop implementation; close/rerun/drop invalidate before aborting. Tests reject queued stale bytes even before the replacement reader emits anything.
+- Bounded per-pane history retains 1024 sequence records and at most 1MiB recent bytes, not duplicate event payloads. Subscriber cursors detect eviction, internal sequence holes and generation resets; recovery resends a complete current viewport without replaying a possibly partial VT suffix. Parser delivery remains lossless for current-generation output.
+- Subscriber initial-send/update/close failures remove the subscriber; invalid resubscription removes previous state; pane close removes cursors/viewports/history. Server render forwarding filters disconnected clients/watchers for both ANSI and structured Frame payloads. Detach uses NormalDetached.
+- Native input keeps upstream INPUT_RECORD modifier handling. The fork's heuristic reconstructing CSI-u from literal characters was intentionally not copied: text like `[113;5u` could become Ctrl-Q. Regression tests preserve that literal text, actual Ctrl modifiers, and key-release filtering. WT uses upstream's raw VT parser, which does not need this heuristic.
+- `ZELLIJ_INPUT_TRACE=1` enables bounded hexadecimal diagnostics at VT/native/server-key boundaries. It is disabled by default and may expose passwords/pasted secrets; do not enable in normal operation.
+- Job-restricted launch now retries permitted breakaway for access-denied/quota errors. The isolated subprocess test allows the parent plus ConPTY host but no ordinary child: normal spawn fails, breakaway succeeds. Reallocating the host during this retry caused a real quota race; only passthrough fallback recreates the console.
+
+## Input-stall integration
+
+- The Windows backend now exposes nonblocking retry/acknowledgement to upstream's per-terminal scheduler. Queue admission is NOT acknowledged as an OS write; only completed bytes advance the scheduler. Each pane has a bounded 64-message worker queue and 4KiB transfers.
+- rmux-derived overlapped input uses its 2s no-progress + 500ms recovery policy. Recovery keeps the SAME outstanding operation alive instead of cancelling/resubmitting possibly exposed bytes. Permanent timeout stops that pane's input with an explicit error. CancelIoEx is always followed by completion drain before releasing buffers or OVERLAPPED memory; a completion that wins cancellation is acknowledged.
+- Input uses a private UUID named pipe with protected current-user-only DACL, non-inheritable handles, first-instance enforcement, remote-client rejection and connected-process identity validation. Output remains an anonymous blocking pipe.
+- DSR, SIGINT and focus events use the same worker FIFO without stealing the scheduler's user-write acknowledgement. A bounded ordered barrier replaces blocking FlushFileBuffers. Queue overflow reports an error; the Windows scheduler retains its outstanding head instead of replacing it. A scheduler cancellation acknowledgement removes old pending input before terminal-ID reuse.
+- Explicit pane close cancels and joins input before closing ConPTY; root-process exit alone still does not terminate descendants. Natural full-Job exit preserves output EOF consumption.
+- Adapted sources include RMUX Authors attribution and the complete MIT notice in `zellij-server/src/windows_input.LICENSE` (rmux 1f4571e7; changes 28c4ba6c/15365111). No new crate dependency or user-facing CLI/config/IPC option was introduced.
+
+## Unicode and IPC verification
+
+- Added exact-byte large bracketed paste/Unicode delivery through the real Windows input pipe, a cross-platform IPC endpoint restart/reconnect test with large Unicode messages, and real ConPTY shell input tests splitting every UTF-8 byte boundary.
+- Headless shell checks: cmd and PowerShell 7 preserve Korean + emoji; Windows PowerShell 5.1 preserves Korean, and its cooked input (PSReadLine removed only in the test child) also preserves emoji. The test emulates later cursor-position queries, normally handled by Zellij's grid.
+- **Known external compatibility failure:** Windows PowerShell 5.1 with installed PSReadLine 2.0.0 drops emoji keyboard input while preserving Korean. Reproduced with passthrough both enabled and disabled. Removing PSReadLine in the isolated child makes the same bytes pass; PowerShell 7 / PSReadLine 2.4.5 passes. No user module/profile was modified. An explicitly ignored compatibility probe retains this known failing case; this is NOT a passed/default-shell emoji check. Logs: D:/Git/zw-winps-legacy-readline-test.log, zw-winps-unicode-fallback-test.log, zw-winps-cooked-unicode-test.log.
+- Console decoder now retains an incomplete Unicode suffix even after earlier invalid UTF-8 bytes; added regression coverage.
+
+## Remaining validation
+
+- The release build passed. Default-feature and no-default-feature workspace runs reached the GUI tests, where the same two watcher cases hung; neither full workspace run is a pass. Actual Windows Terminal/native-console interactive matrix remains unrun. Headless ConPTY shell checks are not a substitute for these UI checks.
+- Resolve or explicitly accept the external PSReadLine 2.0.0 non-BMP input limitation before declaring the complete shell matrix verified.
+
+## Verification ledger
+
+Windows MSVC, repository-pinned Rust 1.95.0 (baseline and integration results distinguished below):
+
+- `cargo test -p zellij-server --lib --no-default-features --no-run`: PASS (initial dependency compilation timed out at 200s; retry completed). Six upstream warnings.
+- `cargo test -p zellij-server --lib --no-default-features os_input_output_windows -- --test-threads=1`: PASS, 6 tests.
+- Original upstream full server library baseline: 2479 passed, 180 ignored.
+- Integrated server library with `--no-default-features`: 2519 passed, 181 ignored (including closed-plugin-channel teardown). Log: D:/Git/zw-server-tests.log. The extra ignored test is an isolated subprocess helper executed by the passing Job-breakaway parent test; the other 180 ignores are inherited.
+- Output/gap/subscriber tests, including closed-plugin teardown: 17 passed. Log: D:/Git/zw-output-tests.log.
+- Job breakaway regression: PASS after correcting the host-reallocation quota race. Log: D:/Git/zw-job-breakaway-tests.log. Earlier failed attempts remain reflected in the old focused log; the subsequent full library run is the current result.
+- Real cmd output/EOF with `ZELLIJ_CONPTY_NO_PASSTHROUGH=1`: PASS. Log: D:/Git/zw-conpty-fallback-tests.log.
+- Integrated client library tests with `--no-default-features`: PASS, 186 passed, 0 failed/ignored. Log: D:/Git/zw-client-tests.log.
+- Input trace utility tests: 3 passed. Log: D:/Git/zw-input-trace-tests.log.
+- Changed Rust files: targeted rustfmt check PASS; git diff --check PASS.
+- Bounded-input integration: Windows backend/pipe/worker suite 42 passed; one ignored subprocess helper is executed by its parent test. Scheduler suite 10 passed. Logs: D:/Git/zw-input-all-windows-tests.log, D:/Git/zw-input-scheduler-tests.log.
+- Eight repeated Windows backend suites with 4 test threads: all passed (336 test executions), including real ConPTY stall/other-pane responsiveness, cancellation/drain, wrapper descendants, output-before-exit, repeated handle cleanup and restrictive-parent-Job breakaway. Logs: D:/Git/zw-conpty-race-{1..8}.log.
+- First full workspace no-default-feature run built successfully but failed the new legacy PSReadLine emoji probe (2536 server tests passed, 1 failed). This failure was isolated as described above; the passing cooked-input check is not relabelled as default PSReadLine compatibility. A release build was deliberately interrupted to investigate it.
+- Latest Windows workspace runs (both default and no-default features): server 2539 passed / 183 ignored; client 297 passed (workspace feature unification); utils 1059 passed / 2 ignored. Both full runs were stopped at two hanging, unchanged GUI watcher tests, so these are component passes, NOT workspace passes. Logs: D:/Git/zw-workspace-tests-final.log, zw-workspace-default-tests.log.
+- Standalone client no-default features: 187 passed. Optional installed PowerShell 7 Unicode probe: passed. Debug WASM build of all bundled plugin packages: passed. Logs: D:/Git/zw-client-final.log, zw-pwsh-unicode-final.log, zw-plugin-debug-build.log.
+- Default-feature GUI tests with exactly the two known watcher hangs excluded: 1304 passed, 1 ignored, 2 filtered out. Log: D:/Git/zw-window-tests-excluding-watchers.log. The earlier golden replay failures came from CRLF checkout conversion in five raw terminal-stream fixtures; restoring their exact HEAD LF bytes made the golden test pass. No fixture content change is staged or present in the Git diff.
+- Default-feature release build `cargo build --release -p zellij --bin zellij`: PASS (22m48s). `--version` reports `zellij 0.46.0`; `--help` exits successfully. Artifact: `D:/Git/zw/target/release/zellij.exe`; SHA-256 `7C24D0654392FAC59A51C9E9E1930746AB6A6C8C331CD71CC32BA41458290620`. Logs: D:/Git/zw-release-build-final.log, zw-release-help.log.
+- Final changed-file rustfmt check and git diff --check: PASS. No staged changes. Original `D:/Git/zellij/zellij` remains on main at b14c8a3ff with only its pre-existing untracked yazi.txt. User profiles/modules and the original branch were not modified. No test/build process was left running.
+- Post-input-integration Linux rerun: client 180 / server 2519 passed, using vendored_curl and persistent `/home/lhslhg/.cache/zellij-integration-target`; log D:/Git/zw-linux-tests.log. Separate Linux IPC socket suite, including endpoint restart, passed; log D:/Git/zw-linux-ipc-tests.log.
+- Real shell Unicode checks (cmd, Windows PowerShell Korean, Windows PowerShell cooked Korean+emoji, PowerShell 7 Korean+emoji): 4 passed. Windows IPC restart: 1 passed. Logs: D:/Git/zw-unicode-shell-matrix.log, zw-ipc-restart-test.log.
+- Ubuntu-24.04 WSL no-default-feature client build initially failed because system OpenSSL development files were absent. No OS packages were installed.
+- Retried Linux with the repository's existing `zellij-utils/vendored_curl` feature and isolated `/tmp/zellij-windows-integration-target`: client 180 passed; server 2519 passed, 179 ignored. Logs: `/tmp/zellij-integration-client-vendored-tests-retry.log`, `/tmp/zellij-integration-server-tests.log` (in WSL). The combined command timed out during client compilation; the separate client retry passed. These are not default-feature/workspace/release verification.
+- Windows Terminal shell matrix/native-console interactive checks: NOT RUN.
+
+Logs outside the worktree: D:/Git/zw-baseline-server.log and D:/Git/zw-baseline-server-retry.log.
