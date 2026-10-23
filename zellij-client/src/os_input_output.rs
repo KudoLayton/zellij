@@ -276,8 +276,14 @@ impl ClientOsApi for ClientOsInputOutput {
         }
     }
     fn get_stdout_writer(&self) -> Box<dyn io::Write> {
-        let stdout = ::std::io::stdout();
-        Box::new(stdout)
+        #[cfg(windows)]
+        {
+            crate::windows_console_writer::stdout_writer()
+        }
+        #[cfg(not(windows))]
+        {
+            Box::new(::std::io::stdout())
+        }
     }
 
     fn get_stdin_reader(&self) -> Box<dyn io::BufRead> {

@@ -6,6 +6,8 @@ mod os_input_output_unix;
 #[cfg(windows)]
 #[path = "os_input_output_windows.rs"]
 mod os_input_output_windows;
+#[cfg(windows)]
+mod windows_console_writer;
 
 pub mod cli_client;
 mod command_is_executing;
