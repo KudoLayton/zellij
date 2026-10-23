@@ -94,6 +94,49 @@ fn try_connect(name: &IpcName) -> std::io::Result<interprocess::local_socket::St
 }
 
 #[test]
+fn endpoint_restart_reconnects_without_replaying_prior_generation() {
+    let (_guard, name) = new_ipc();
+    for generation in 0..5 {
+        let listener = bind_listener(&name);
+        let expected = format!("generation-{generation}:{}", "한😀".repeat(4096));
+        let payload = expected.clone();
+        let server = std::thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut sender = IpcSenderWithContext::<ServerToClientMsg>::new(stream);
+            let mut receiver = sender.get_receiver::<ClientToServerMsg>();
+            assert!(matches!(
+                receiver.recv_client_msg().unwrap().0,
+                ClientToServerMsg::ConnStatus
+            ));
+            sender
+                .send_server_msg(ServerToClientMsg::Render { content: payload })
+                .unwrap();
+            assert!(matches!(
+                receiver.recv_client_msg().unwrap().0,
+                ClientToServerMsg::ClientExited
+            ));
+        });
+        let mut sender = IpcSenderWithContext::<ClientToServerMsg>::new(connect_stream(&name));
+        let mut receiver = sender.get_receiver::<ServerToClientMsg>();
+        sender
+            .send_client_msg(ClientToServerMsg::ConnStatus)
+            .unwrap();
+        assert_eq!(
+            receiver.recv_server_msg().unwrap().0,
+            ServerToClientMsg::Render { content: expected }
+        );
+        sender
+            .send_client_msg(ClientToServerMsg::ClientExited)
+            .unwrap();
+        server.join().unwrap();
+        assert!(receiver.recv_server_msg().is_none());
+        drop(receiver);
+        drop(sender);
+        assert!(try_connect(&name).is_err());
+    }
+}
+
+#[test]
 fn client_to_server_message_over_socket() {
     let (_guard, name) = new_ipc();
     let listener = bind_listener(&name);
