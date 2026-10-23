@@ -32,6 +32,7 @@ mod session_previews;
 pub mod session_suggestions;
 mod socket_folder_watcher;
 mod terminal_bytes;
+mod terminal_output;
 mod thread_bus;
 mod ui;
 

@@ -1,3 +1,6 @@
+#[path = "terminal_output_tests.rs"]
+mod terminal_output_tests;
+
 use super::{
     screen_thread_main, CopyOptions, Screen, ScreenInstruction, MAX_REMEMBERED_PANES_NEVER_CREATED,
 };
@@ -189,6 +192,7 @@ struct FakeInputOutput {
     fake_filesystem: Arc<Mutex<HashMap<String, String>>>,
     server_to_client_messages: Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
     tty_stdin_bytes: Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
+    fail_client_sends: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ServerOsApi for FakeInputOutput {
@@ -234,6 +238,12 @@ impl ServerOsApi for FakeInputOutput {
         Box::new((*self).clone())
     }
     fn send_to_client(&self, client_id: ClientId, msg: ServerToClientMsg) -> Result<()> {
+        if self
+            .fail_client_sends
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow!("injected disconnected client"));
+        }
         self.server_to_client_messages
             .lock()
             .unwrap()

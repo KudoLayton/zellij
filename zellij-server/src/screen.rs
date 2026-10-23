@@ -365,7 +365,8 @@ pub struct TabOverrideResult {
 /// Instructions that can be sent to the [`Screen`].
 #[derive(Debug, Clone)]
 pub enum ScreenInstruction {
-    PtyBytes(u32, VteBytes),
+    PtyBytes(u32, VteBytes), // synthetic/internal bytes
+    PtyOutput(crate::terminal_output::TerminalOutput),
     PluginBytes(Vec<PluginRenderAsset>),
     Render,
     RenderToClients,
@@ -1173,7 +1174,9 @@ pub enum ScreenInstruction {
 impl From<&ScreenInstruction> for ScreenContext {
     fn from(screen_instruction: &ScreenInstruction) -> Self {
         match *screen_instruction {
-            ScreenInstruction::PtyBytes(..) => ScreenContext::HandlePtyBytes,
+            ScreenInstruction::PtyBytes(..) | ScreenInstruction::PtyOutput(..) => {
+                ScreenContext::HandlePtyBytes
+            },
             ScreenInstruction::PluginBytes(..) => ScreenContext::PluginBytes,
             ScreenInstruction::Render => ScreenContext::Render,
             ScreenInstruction::RenderToClients => ScreenContext::RenderToClients,
@@ -1786,6 +1789,7 @@ impl WatcherState {
 struct PaneRenderSubscription {
     pane_ids: HashSet<zellij_utils::data::PaneId>,
     previous_viewports: HashMap<zellij_utils::data::PaneId, Vec<String>>,
+    output_cursors: HashMap<u32, crate::terminal_output::TerminalOutputCursor>,
     ansi: bool,
 }
 
@@ -2014,6 +2018,7 @@ pub(crate) struct Screen {
     cached_layouts: Vec<LayoutInfo>,
     cached_layout_errors: Vec<LayoutWithError>,
     pane_render_subscribers: HashMap<ClientId, PaneRenderSubscription>,
+    terminal_output_store: crate::terminal_output::TerminalOutputStore,
     background_plugin_subscriptions: HashMap<(PluginId, ClientId), HashSet<EventType>>,
     last_reported_plugin_tab_indices: HashMap<PluginId, usize>,
     pub(crate) pending_session_card: Option<ClientId>,
@@ -2372,6 +2377,7 @@ impl Screen {
             cached_layouts: vec![],
             cached_layout_errors: vec![],
             pane_render_subscribers: HashMap::new(),
+            terminal_output_store: crate::terminal_output::TerminalOutputStore::new(),
             background_plugin_subscriptions: HashMap::new(),
             last_reported_plugin_tab_indices: HashMap::new(),
             pending_session_card: None,
@@ -8960,6 +8966,26 @@ impl Screen {
             .or(reason_from_tabs)
             .unwrap_or(PaneNotCreatedReason::Unknown)
     }
+    fn apply_terminal_output(
+        &mut self,
+        output: crate::terminal_output::TerminalOutput,
+    ) -> Result<Option<crate::terminal_output::TerminalOutput>> {
+        if !output.is_current() {
+            return Ok(None);
+        }
+        if !self
+            .tabs
+            .values()
+            .any(|tab| tab.has_terminal_pid(output.terminal_id))
+        {
+            return Ok(Some(output));
+        }
+        if self.terminal_output_store.push(&output) {
+            self.apply_pty_bytes(output.terminal_id, output.bytes)?;
+        }
+        Ok(None)
+    }
+
     fn apply_pty_bytes(&mut self, pid: u32, vte_bytes: VteBytes) -> Result<Option<VteBytes>> {
         self.pane_output_activity
             .insert(PaneId::Terminal(pid), Instant::now());
@@ -9015,6 +9041,9 @@ impl Screen {
                     match event {
                         ScreenInstruction::PtyBytes(terminal_id, vte_bytes) => {
                             self.apply_pty_bytes(terminal_id, vte_bytes).non_fatal();
+                        },
+                        ScreenInstruction::PtyOutput(output) => {
+                            self.apply_terminal_output(output).non_fatal();
                         },
                         event => {
                             self.bus.senders.send_to_screen(event).non_fatal();
@@ -10158,6 +10187,7 @@ impl Screen {
         scrollback: Option<usize>,
         ansi: bool,
     ) {
+        self.pane_render_subscribers.remove(&subscriber_client_id);
         let mut previous_viewports = HashMap::new();
         let mut valid_pane_ids = HashSet::new();
 
@@ -10199,7 +10229,7 @@ impl Screen {
                         } else {
                             None
                         };
-                        let _ = os_input.send_to_client(
+                        let sent = os_input.send_to_client(
                             subscriber_client_id,
                             ServerToClientMsg::PaneRenderUpdate {
                                 pane_id: *pane_id,
@@ -10208,6 +10238,11 @@ impl Screen {
                                 is_initial: true,
                             },
                         );
+                        if sent.is_err() {
+                            return;
+                        }
+                    } else {
+                        return;
                     }
 
                     previous_viewports.insert(*pane_id, contents.viewport);
@@ -10230,11 +10265,21 @@ impl Screen {
         }
 
         if !valid_pane_ids.is_empty() {
+            let output_cursors = valid_pane_ids
+                .iter()
+                .filter_map(|pane_id| match pane_id {
+                    zellij_utils::data::PaneId::Terminal(id) => {
+                        Some((*id, self.terminal_output_store.cursor_from_now(*id)))
+                    },
+                    _ => None,
+                })
+                .collect();
             self.pane_render_subscribers.insert(
                 subscriber_client_id,
                 PaneRenderSubscription {
                     pane_ids: valid_pane_ids,
                     previous_viewports,
+                    output_cursors,
                     ansi,
                 },
             );
@@ -10290,7 +10335,7 @@ impl Screen {
         let mut updates_to_send: Vec<(ClientId, ServerToClientMsg)> = Vec::new();
         let mut dead_subscribers: Vec<ClientId> = Vec::new();
 
-        for (subscriber_id, subscription) in &self.pane_render_subscribers {
+        for (subscriber_id, subscription) in &mut self.pane_render_subscribers {
             let effective_map = if subscription.ansi {
                 ansi_pane_map.unwrap_or(pane_map)
             } else {
@@ -10299,10 +10344,17 @@ impl Screen {
 
             for pane_id in &subscription.pane_ids {
                 if let Some(contents) = effective_map.get(pane_id) {
+                    let gap = match pane_id {
+                        zellij_utils::data::PaneId::Terminal(id) => subscription
+                            .output_cursors
+                            .get_mut(id)
+                            .and_then(|cursor| self.terminal_output_store.advance(*id, cursor)),
+                        _ => None,
+                    };
                     let changed = subscription
                         .previous_viewports
                         .get(pane_id)
-                        .map(|prev| prev != &contents.viewport)
+                        .map(|prev| prev != &contents.viewport || gap.is_some())
                         .unwrap_or(true);
 
                     if changed {
@@ -10352,15 +10404,28 @@ impl Screen {
         }
     }
     fn notify_pane_closed_to_subscribers(&mut self, pane_id: zellij_utils::data::PaneId) {
+        if let zellij_utils::data::PaneId::Terminal(id) = pane_id {
+            self.terminal_output_store.remove(id);
+        }
         let mut dead_subscribers = Vec::new();
 
         for (subscriber_id, subscription) in &mut self.pane_render_subscribers {
             if subscription.pane_ids.remove(&pane_id) {
+                subscription.previous_viewports.remove(&pane_id);
+                if let zellij_utils::data::PaneId::Terminal(id) = pane_id {
+                    subscription.output_cursors.remove(&id);
+                }
                 if let Some(os_input) = &self.bus.os_input {
-                    let _ = os_input.send_to_client(
-                        *subscriber_id,
-                        ServerToClientMsg::SubscribedPaneClosed { pane_id },
-                    );
+                    if os_input
+                        .send_to_client(
+                            *subscriber_id,
+                            ServerToClientMsg::SubscribedPaneClosed { pane_id },
+                        )
+                        .is_err()
+                    {
+                        dead_subscribers.push(*subscriber_id);
+                        continue;
+                    }
                 }
                 if subscription.pane_ids.is_empty() {
                     if let Some(os_input) = &self.bus.os_input {
@@ -10683,6 +10748,17 @@ pub(crate) fn screen_thread_main(
         }
 
         match event {
+            ScreenInstruction::PtyOutput(output) => {
+                if let Some(output) = screen.apply_terminal_output(output)? {
+                    let pane_id = PaneId::Terminal(output.terminal_id);
+                    if !screen.pane_will_never_be_created(&pane_id) {
+                        pending_events_waiting_for_pane
+                            .entry(pane_id)
+                            .or_default()
+                            .push(ScreenInstruction::PtyOutput(output));
+                    }
+                }
+            },
             ScreenInstruction::PtyBytes(pid, vte_bytes) => {
                 if let Some(vte_bytes) = screen.apply_pty_bytes(pid, vte_bytes)? {
                     if !screen.pane_will_never_be_created(&PaneId::Terminal(pid)) {

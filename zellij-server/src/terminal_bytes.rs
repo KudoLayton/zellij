@@ -1,4 +1,9 @@
-use crate::{os_input_output::AsyncReader, screen::ScreenInstruction, thread_bus::ThreadSenders};
+use crate::{
+    os_input_output::AsyncReader,
+    screen::ScreenInstruction,
+    terminal_output::{TerminalOutput, TerminalStreamGuard},
+    thread_bus::ThreadSenders,
+};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -18,6 +23,8 @@ pub(crate) struct TerminalBytes {
     async_reader: Box<dyn AsyncReader>,
     debug: bool,
     activity_flag: Arc<AtomicBool>,
+    stream_guard: TerminalStreamGuard,
+    sequence: u64,
 }
 
 impl TerminalBytes {
@@ -27,6 +34,7 @@ impl TerminalBytes {
         senders: ThreadSenders,
         debug: bool,
         activity_flag: Arc<AtomicBool>,
+        stream_guard: TerminalStreamGuard,
     ) -> Self {
         TerminalBytes {
             terminal_id,
@@ -34,6 +42,8 @@ impl TerminalBytes {
             debug,
             async_reader,
             activity_flag,
+            stream_guard,
+            sequence: 0,
         }
     }
     pub async fn listen(&mut self) -> Result<()> {
@@ -60,11 +70,21 @@ impl TerminalBytes {
                     break;
                 },
                 Ok(bytes) => {
+                    if !self.stream_guard.is_current() {
+                        break;
+                    }
                     self.activity_flag.store(true, Ordering::Relaxed);
                     if self.debug {
                         let _ = debug_to_file(&bytes, self.terminal_id as i32);
                     }
-                    self.async_send_to_screen(ScreenInstruction::PtyBytes(self.terminal_id, bytes))
+                    let output = TerminalOutput::new(
+                        self.terminal_id,
+                        bytes,
+                        self.sequence,
+                        self.stream_guard.clone(),
+                    );
+                    self.sequence = self.sequence.saturating_add(1);
+                    self.async_send_to_screen(ScreenInstruction::PtyOutput(output))
                         .await
                         .with_context(err_context)?;
                 },
@@ -85,7 +105,9 @@ impl TerminalBytes {
         //
         // FIXME: Ideally we detect whether the application is being quit and only ignore the error
         // in that particular case?
-        let _ = self.async_send_to_screen(ScreenInstruction::Render).await;
+        if self.stream_guard.is_current() {
+            let _ = self.async_send_to_screen(ScreenInstruction::Render).await;
+        }
 
         Ok(())
     }
