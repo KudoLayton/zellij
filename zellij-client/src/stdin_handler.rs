@@ -132,6 +132,7 @@ pub(crate) fn stdin_loop(
             Ok(result) => {
                 match result {
                     Ok(buf) => {
+                        zellij_utils::input_trace::trace_bytes("stdin/vt", &buf);
                         // Strip + classify any host-reply sequences
                         // continuously. The residue is the byte stream
                         // the keyboard parser should see.

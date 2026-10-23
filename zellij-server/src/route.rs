@@ -2951,6 +2951,7 @@ pub(crate) fn route_thread_main(
                                         s.modal_popup_clients.contains(&client_id);
                                     let (kb, im, dim) =
                                         s.get_client_keybinds_and_mode(&client_id)?;
+                                    zellij_utils::input_trace::trace_bytes("server/key", &raw_bytes);
                                     let key_actions = popup_keys::key_dispatch(
                                         kb,
                                         im,

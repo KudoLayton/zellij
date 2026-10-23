@@ -14,6 +14,7 @@ mod home_unix;
 #[cfg(windows)]
 mod home_windows;
 pub mod input;
+pub mod input_trace;
 pub mod kdl;
 pub mod nested_session_contract;
 pub mod pane_size;

@@ -84,6 +84,21 @@ pub(crate) fn restore_vt_input() {
     }
 }
 
+#[cfg(test)]
+#[path = "native_input_tests.rs"]
+mod tests;
+
+fn native_key_instruction(event: crossterm::event::KeyEvent) -> Option<InputInstruction> {
+    if event.kind != KeyEventKind::Press {
+        return None;
+    }
+    let (key, bytes) = cast_crossterm_key(event)?;
+    zellij_utils::input_trace::trace_bytes("stdin/native-key", &bytes);
+    // Native INPUT_RECORDs already carry modifiers. Do not guess CSI-u keys
+    // from literal text such as "[113;5u" (which could accidentally quit).
+    Some(InputInstruction::KeyWithModifierEvent(key, bytes, false))
+}
+
 /// Windows native console event loop.
 ///
 /// Uses crossterm's `event::read()` which reads INPUT_RECORDs via
@@ -98,14 +113,8 @@ pub(crate) fn native_console_stdin_loop(
     loop {
         match event::read() {
             Ok(Event::Key(key_event)) => {
-                if key_event.kind != KeyEventKind::Press {
-                    continue;
-                }
-                if let Some((key, bytes)) = cast_crossterm_key(key_event) {
-                    if send_input_instructions
-                        .send(InputInstruction::KeyWithModifierEvent(key, bytes, false))
-                        .is_err()
-                    {
+                if let Some(instruction) = native_key_instruction(key_event) {
+                    if send_input_instructions.send(instruction).is_err() {
                         break;
                     }
                 }
@@ -121,6 +130,7 @@ pub(crate) fn native_console_stdin_loop(
             },
             Ok(Event::Paste(text)) => {
                 let raw_bytes = text.as_bytes().to_vec();
+                zellij_utils::input_trace::trace_bytes("stdin/native-paste", &raw_bytes);
                 let paste_event = InputEvent::Paste(text);
                 if send_input_instructions
                     .send(InputInstruction::KeyEvent(paste_event, raw_bytes))
