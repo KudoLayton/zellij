@@ -6,126 +6,61 @@ use std::{
     ffi::OsStr,
     io,
     os::windows::ffi::OsStrExt,
-    os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle},
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
 };
 
-use tokio::net::windows::named_pipe::NamedPipeServer;
-
+#[path = "windows_conpty.rs"]
+mod windows_conpty;
+#[path = "windows_conpty_reader.rs"]
+mod windows_conpty_reader;
 #[path = "windows_input.rs"]
 mod windows_input;
 #[path = "windows_input_pipe.rs"]
 mod windows_input_pipe;
+#[path = "windows_job.rs"]
+mod windows_job;
+use windows_conpty::{Console, PASSTHROUGH};
+use windows_input::InputWriter;
+use windows_job::Job;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-};
-use windows_sys::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, GenerateConsoleCtrlEvent, ResizePseudoConsole, COORD,
-    CTRL_C_EVENT, HPCON,
-};
-use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, CreatePipe};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
+use windows_sys::Win32::System::Console::{ResizePseudoConsole, COORD, HPCON};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, OpenProcess, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    PROCESS_INFORMATION, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    InitializeProcThreadAttributeList, OpenProcess, ResumeThread, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+    PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 use zellij_utils::{errors::prelude::*, input::command::RunCommand};
 
-pub use async_trait::async_trait;
-
 // Not exported by windows-sys; value from the Windows SDK.
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x00020016;
-const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x00080000;
-const PIPE_ACCESS_INBOUND: u32 = 0x00000001;
-const PIPE_TYPE_BYTE: u32 = 0;
-const PIPE_WAIT: u32 = 0;
-const GENERIC_WRITE: u32 = 0x40000000;
-
-/// Monotonic counter so each ConPTY output pipe gets a unique name, even when
-/// re-spawning on the same `terminal_id` (the old async reader may still hold
-/// the previous pipe handle).
-static PIPE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Per-terminal ConPTY state.
+/// Drop the Job before the console: descendants must stop before pipe teardown.
 struct ConPtyTerminal {
-    hpcon: HPCON,
-    input_write_handle: HANDLE,
+    job: Job,
+    console: Mutex<Console>,
+    input: Arc<InputWriter>,
+    child_pid: u32,
+    closing: Arc<AtomicBool>,
 }
 
-// HANDLE/HPCON are raw pointers in windows-sys >= 0.59; OS handles are
-// safe to send across threads.
-unsafe impl Send for ConPtyTerminal {}
-unsafe impl Sync for ConPtyTerminal {}
-
-impl Drop for ConPtyTerminal {
-    fn drop(&mut self) {
-        unsafe {
-            // Close the pseudo console first — it may write a final VT frame
-            // to the output pipe. The async reader task (if still alive) will
-            // drain it. Then close the remaining handle.
-            ClosePseudoConsole(self.hpcon);
-            CloseHandle(self.input_write_handle);
+impl ConPtyTerminal {
+    fn close(&self) {
+        self.closing.store(true, Ordering::Release);
+        if let Err(error) = self.job.terminate() {
+            log::debug!("Pane job teardown: {error}");
         }
+        self.console.lock().unwrap().close_after_exit();
     }
-}
 
-/// An `AsyncReader` backed by a named pipe connected to ConPTY output.
-///
-/// Construction stores the raw `OwnedHandle`. The first `read()` call promotes
-/// it to a `NamedPipeServer` (IOCP registration requires a live Tokio reactor,
-/// which is not available at `spawn_terminal` time).
-struct ConPtyAsyncReader {
-    pending: Option<OwnedHandle>,
-    pipe: Option<NamedPipeServer>,
-}
-
-// OwnedHandle is Send+Sync; NamedPipeServer is Send.
-// The reader is only ever used from a single async task (via &mut self),
-// so Sync is safe.
-unsafe impl Sync for ConPtyAsyncReader {}
-
-impl ConPtyAsyncReader {
-    fn new(handle: OwnedHandle) -> Self {
-        Self {
-            pending: Some(handle),
-            pipe: None,
-        }
-    }
-}
-
-#[async_trait]
-impl AsyncReader for ConPtyAsyncReader {
-    async fn read_chunk(&mut self, max: usize) -> Result<Vec<u8>, io::Error> {
-        let pipe = self.pipe()?;
-        loop {
-            pipe.readable().await?;
-            let mut buf = vec![0u8; max];
-            match pipe.try_read(&mut buf) {
-                Ok(n) => return Ok(buf[..n].to_vec()),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-
-impl ConPtyAsyncReader {
-    fn pipe(&mut self) -> Result<&mut NamedPipeServer, io::Error> {
-        if let Some(handle) = self.pending.take() {
-            let pipe = unsafe { NamedPipeServer::from_raw_handle(handle.into_raw_handle()) }?;
-            self.pipe = Some(pipe);
-        }
-        Ok(self
-            .pipe
-            .as_mut()
-            .expect("ConPtyAsyncReader used after init"))
+    fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        self.input.try_write(buf)
     }
 }
 
@@ -230,77 +165,6 @@ fn build_environment_block(terminal_id: u32, pane_env: &PaneEnv) -> Vec<u16> {
     block
 }
 
-/// Create an overlapped named-pipe pair for ConPTY output.
-///
-/// Returns `(server_read_handle, client_write_handle)` where the server
-/// (read) end has `FILE_FLAG_OVERLAPPED` for IOCP and the client (write) end
-/// is synchronous (required by ConPTY).
-fn create_overlapped_output_pipe(terminal_id: u32) -> io::Result<(HANDLE, HANDLE)> {
-    let seq = PIPE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let name = format!(
-        r"\\.\pipe\zellij-pty-{}-{}-{}",
-        std::process::id(),
-        terminal_id,
-        seq
-    );
-    let wide_name = to_wide(&name);
-
-    let server = unsafe {
-        CreateNamedPipeW(
-            wide_name.as_ptr(),
-            PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            PIPE_TYPE_BYTE | PIPE_WAIT,
-            1,     // max instances
-            0,     // out buffer (we only read)
-            65536, // in buffer
-            0,     // default timeout
-            std::ptr::null(),
-        )
-    };
-    if server == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-
-    let client = unsafe {
-        CreateFileW(
-            wide_name.as_ptr(),
-            GENERIC_WRITE,
-            0,                    // no sharing
-            std::ptr::null(),     // default security
-            OPEN_EXISTING,        // pipe already exists
-            0,                    // synchronous
-            std::ptr::null_mut(), // no template
-        )
-    };
-    if client == INVALID_HANDLE_VALUE {
-        unsafe { CloseHandle(server) };
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok((server, client))
-}
-
-/// Create a ConPTY pseudo console of the given size attached to the provided
-/// pipes.
-fn create_conpty(
-    cols: u16,
-    rows: u16,
-    input_read: HANDLE,
-    output_write: HANDLE,
-) -> io::Result<HPCON> {
-    let size = COORD {
-        X: cols as i16,
-        Y: rows as i16,
-    };
-    let mut hpcon: HPCON = 0;
-    let hr = unsafe { CreatePseudoConsole(size, input_read, output_write, 0, &mut hpcon) };
-    if hr != S_OK {
-        Err(io::Error::from_raw_os_error(hr))
-    } else {
-        Ok(hpcon)
-    }
-}
-
 /// Spawn a child process attached to the given ConPTY.
 ///
 /// Returns `(process_handle, thread_handle, child_pid)`.
@@ -309,6 +173,7 @@ fn spawn_child_process(
     cmd: &RunCommand,
     terminal_id: u32,
     pane_env: &PaneEnv,
+    breakaway: bool,
 ) -> io::Result<(HANDLE, HANDLE, u32)> {
     // --- proc thread attribute list ---
     let mut attr_size: usize = 0;
@@ -378,7 +243,14 @@ fn spawn_child_process(
             std::ptr::null(),      // lpProcessAttributes
             std::ptr::null(),      // lpThreadAttributes
             0,                     // bInheritHandles = FALSE
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_UNICODE_ENVIRONMENT
+                | CREATE_SUSPENDED
+                | if breakaway {
+                    CREATE_BREAKAWAY_FROM_JOB
+                } else {
+                    0
+                },
             env_block.as_ptr().cast(),              // lpEnvironment
             cwd_ptr,                                // lpCurrentDirectory
             &si.StartupInfo as *const STARTUPINFOW, // lpStartupInfo
@@ -393,6 +265,41 @@ fn spawn_child_process(
     }
 
     Ok((pi.hProcess, pi.hThread, pi.dwProcessId))
+}
+
+fn spawn_managed_child(
+    hpcon: HPCON,
+    cmd: &RunCommand,
+    id: u32,
+    env: &PaneEnv,
+    breakaway: bool,
+) -> io::Result<(OwnedHandle, u32, Job)> {
+    let (process, thread, pid) = spawn_child_process(hpcon, cmd, id, env, breakaway)?;
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
+    let handle = process.as_raw_handle() as HANDLE;
+    let setup = (|| -> io::Result<Job> {
+        let job = Job::new()?;
+        job.assign(handle)?;
+        if unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) } == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(job)
+    })();
+    match setup {
+        Ok(job) => Ok((process, pid, job)),
+        Err(error) => {
+            unsafe {
+                TerminateProcess(handle, 1);
+            }
+            Err(error)
+        },
+    }
+}
+
+fn is_benign_resize_after_exit_hresult(hr: i32) -> bool {
+    // E_HANDLE, broken pipe, and invalid parameter can race process exit.
+    matches!(hr as u32, 0x80070006 | 0x8007006d | 0x80070057)
 }
 
 fn terminate_process(pid: u32) -> std::result::Result<(), std::io::Error> {
@@ -414,10 +321,10 @@ fn terminate_process(pid: u32) -> std::result::Result<(), std::io::Error> {
 // WindowsPtyBackend
 // ---------------------------------------------------------------------------
 
-/// Windows PTY backend using native ConPTY with IOCP-based async I/O.
+/// Windows PTY backend with bounded blocking ConPTY output.
 #[derive(Clone)]
 pub(crate) struct WindowsPtyBackend {
-    terminals: Arc<Mutex<BTreeMap<u32, Option<ConPtyTerminal>>>>,
+    terminals: Arc<Mutex<BTreeMap<u32, Option<Arc<ConPtyTerminal>>>>>,
     next_terminal_id_counter: Arc<AtomicU32>,
 }
 
@@ -444,93 +351,121 @@ impl WindowsPtyBackend {
             )
         };
 
-        // 1. Output pipe pair (named, overlapped read end for IOCP)
-        let (output_read, output_write) =
-            create_overlapped_output_pipe(terminal_id).with_context(|| err_context(&cmd))?;
-
-        // 2. Input pipe pair (anonymous, both synchronous)
-        let mut input_read: HANDLE = std::ptr::null_mut();
-        let mut input_write: HANDLE = std::ptr::null_mut();
-        if unsafe { CreatePipe(&mut input_read, &mut input_write, std::ptr::null(), 0) } == 0 {
-            unsafe {
-                CloseHandle(output_read);
-                CloseHandle(output_write);
-            }
-            return Err(io::Error::last_os_error()).with_context(|| err_context(&cmd));
-        }
-
-        // 3. Create pseudo console
-        let hpcon = match create_conpty(80, 24, input_read, output_write) {
-            Ok(h) => h,
-            Err(e) => {
-                unsafe {
-                    CloseHandle(output_read);
-                    CloseHandle(output_write);
-                    CloseHandle(input_read);
-                    CloseHandle(input_write);
-                }
-                return Err(e).with_context(|| err_context(&cmd));
-            },
-        };
-
-        // 4. ConPTY duplicated the pipe ends it needs; close our copies.
-        unsafe {
-            CloseHandle(input_read);
-            CloseHandle(output_write);
-        }
-
-        // 5. Spawn child process
-        let (process_handle, thread_handle, child_pid) =
-            match spawn_child_process(hpcon, &cmd, terminal_id, pane_env) {
-                Ok(r) => r,
-                Err(e) => {
-                    unsafe {
-                        ClosePseudoConsole(hpcon);
-                        CloseHandle(input_write);
-                        CloseHandle(output_read);
+        let bootstrap = cmd
+            .command
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|name| {
+                name.eq_ignore_ascii_case("pwsh") || name.eq_ignore_ascii_case("powershell")
+            })
+            .unwrap_or(false);
+        let mut flags = windows_conpty::selected_flags();
+        let (console, reader, process, child_pid, job, input) = loop {
+            let (console, reader) =
+                Console::create(80, 24, flags, bootstrap).with_context(|| {
+                    format!(
+                        "allocate ConPTY for {} (flags {flags:#x})",
+                        cmd.command.display()
+                    )
+                })?;
+            let input = console.input.clone();
+            // Reuse the allocated host for a permitted Job breakaway retry.
+            // Creating a second host can itself exceed the enclosing Job quota
+            // while the first host is still asynchronously exiting.
+            let spawned = spawn_managed_child(console.hpcon, &cmd, terminal_id, pane_env, false)
+                .or_else(|error| {
+                    if matches!(error.raw_os_error(), Some(5 | 1816)) {
+                        log::debug!("Pane Job setup denied: {error}; retry permitted breakaway");
+                        spawn_managed_child(console.hpcon, &cmd, terminal_id, pane_env, true)
+                    } else {
+                        Err(error)
                     }
-                    return Err(e).with_context(|| err_context(&cmd));
+                });
+            match spawned {
+                Ok((process, pid, job)) => break (console, reader, process, pid, job, input),
+                Err(error) if console.flags & PASSTHROUGH != 0 => {
+                    log::debug!(
+                        "Passthrough spawn failed: {error}; recreate ConPTY without passthrough"
+                    );
+                    flags = windows_conpty::fallback_flags(console.flags).unwrap();
                 },
-            };
-
-        // Thread handle is not needed after spawn.
-        unsafe { CloseHandle(thread_handle) };
-
-        // 6. Store per-terminal state
-        self.terminals.lock().unwrap().insert(
-            terminal_id,
-            Some(ConPtyTerminal {
-                hpcon,
-                input_write_handle: input_write,
-            }),
-        );
-
-        // 7. Exit-monitoring thread (zero CPU — spends all time in kernel wait)
-        // Pass the HANDLE through as `usize` because raw pointers are not
-        // Send. Windows OS handles are safe to use cross-thread.
-        let cmd_for_monitor = cmd.clone();
-        let process_handle_addr = process_handle as usize;
-        std::thread::spawn(move || {
-            let process_handle = process_handle_addr as HANDLE;
-            let exit_code = unsafe {
-                WaitForSingleObject(process_handle, INFINITE);
-                let mut code: u32 = 0;
-                GetExitCodeProcess(process_handle, &mut code);
-                CloseHandle(process_handle);
-                code
-            };
-            quit_cb(
-                PaneId::Terminal(terminal_id),
-                Some(exit_code as i32),
-                cmd_for_monitor,
-            );
+                Err(error) => return Err(error).with_context(|| err_context(&cmd)),
+            }
+            // Passthrough fallback always gets fresh console resources.
+            drop(reader);
+            drop(console);
+        };
+        let terminal = Arc::new(ConPtyTerminal {
+            job,
+            closing: console.discard_signal(),
+            console: Mutex::new(console),
+            input,
+            child_pid,
         });
+        let watched = Arc::downgrade(&terminal);
+        let output_consumed = reader.consumed_signal();
+        let replaced = self
+            .terminals
+            .lock()
+            .unwrap()
+            .insert(terminal_id, Some(terminal));
+        if let Some(Some(previous)) = replaced {
+            previous.close();
+        } // outside global lock
 
-        // 8. Wrap the output read handle in an async reader
-        let owned = unsafe { OwnedHandle::from_raw_handle(output_read as *mut core::ffi::c_void) };
-        let reader = Box::new(ConPtyAsyncReader::new(owned)) as Box<dyn AsyncReader>;
-
-        Ok((reader, child_pid))
+        let monitor = std::thread::Builder::new()
+            .name("zellij-conpty-exit".into())
+            .spawn(move || {
+                let handle = process.as_raw_handle() as HANDLE;
+                let exit_code = unsafe {
+                    WaitForSingleObject(handle, INFINITE);
+                    let mut code = 0;
+                    if GetExitCodeProcess(handle, &mut code) != 0 {
+                        Some(code as i32)
+                    } else {
+                        None
+                    }
+                };
+                // A wrapper may exit while its console descendants still run.
+                // Keep the Job and ConPTY alive until the entire tree finishes.
+                loop {
+                    let Some(terminal) = watched.upgrade() else {
+                        return;
+                    };
+                    if terminal.closing.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match terminal.job.active_processes() {
+                        Ok(0) => {
+                            terminal.console.lock().unwrap().close_after_exit();
+                            // Publish pane exit only after the terminal parser has
+                            // consumed the tail (or abandoned the reader).
+                            while !output_consumed.load(Ordering::Acquire)
+                                && !terminal.closing.load(Ordering::Acquire)
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                            }
+                            if !terminal.closing.load(Ordering::Acquire) {
+                                quit_cb(PaneId::Terminal(terminal_id), exit_code, cmd);
+                            }
+                            return;
+                        },
+                        Ok(_) => {},
+                        Err(error) => {
+                            // Do not silently close a potentially live descendant.
+                            log::error!("Cannot query pane Job liveness: {error}");
+                            return;
+                        },
+                    }
+                    drop(terminal);
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            });
+        if let Err(error) = monitor {
+            self.clear_terminal_id(terminal_id);
+            return Err(error).context("failed to start ConPTY exit monitor");
+        }
+        Ok((Box::new(reader), child_pid))
     }
 
     pub fn spawn_terminal(
@@ -573,21 +508,19 @@ impl WindowsPtyBackend {
             )
         };
 
-        match self
-            .terminals
-            .lock()
-            .to_anyhow()
-            .with_context(err_context)?
-            .get(&terminal_id)
-        {
-            Some(Some(term)) => {
+        match self.terminal(terminal_id) {
+            Some(term) => {
                 if cols > 0 && rows > 0 {
+                    let console = term.console.lock().unwrap();
+                    if console.hpcon == 0 {
+                        return Ok(());
+                    }
                     let size = COORD {
-                        X: cols as i16,
-                        Y: rows as i16,
+                        X: cols.min(i16::MAX as u16) as i16,
+                        Y: rows.min(i16::MAX as u16) as i16,
                     };
-                    let hr = unsafe { ResizePseudoConsole(term.hpcon, size) };
-                    if hr != S_OK {
+                    let hr = unsafe { ResizePseudoConsole(console.hpcon, size) };
+                    if hr != S_OK && !is_benign_resize_after_exit_hresult(hr) {
                         Err::<(), _>(anyhow!("ResizePseudoConsole failed: HRESULT 0x{:08x}", hr))
                             .with_context(err_context)
                             .non_fatal();
@@ -606,87 +539,83 @@ impl WindowsPtyBackend {
     pub fn write_to_tty_stdin(&self, terminal_id: u32, buf: &[u8]) -> Result<usize> {
         let err_context = || format!("failed to write to stdin of terminal {}", terminal_id);
 
-        match self
-            .terminals
-            .lock()
-            .to_anyhow()
-            .with_context(err_context)?
-            .get(&terminal_id)
-        {
-            Some(Some(term)) => {
-                let mut written: u32 = 0;
-                let ok = unsafe {
-                    WriteFile(
-                        term.input_write_handle,
-                        buf.as_ptr(),
-                        buf.len() as u32,
-                        &mut written,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 {
-                    Err(io::Error::last_os_error()).with_context(err_context)
-                } else {
-                    Ok(written as usize)
-                }
-            },
+        match self.terminal(terminal_id) {
+            Some(term) => term.write(buf).with_context(err_context),
             _ => Err(anyhow!("no ConPTY terminal found for id {}", terminal_id))
                 .with_context(err_context),
         }
     }
 
     pub fn tcdrain(&self, terminal_id: u32) -> Result<()> {
-        let err_context = || format!("failed to drain terminal {}", terminal_id);
+        self.terminal(terminal_id)
+            .ok_or_else(|| anyhow!("no ConPTY terminal found for id {}", terminal_id))?
+            .input
+            .drain()
+            .with_context(|| format!("failed to drain terminal {terminal_id}"))
+    }
 
-        match self
-            .terminals
+    pub fn write_terminal_control(&self, terminal_id: u32, bytes: &[u8]) -> Result<()> {
+        self.terminal(terminal_id)
+            .ok_or_else(|| anyhow!("no ConPTY terminal found for id {}", terminal_id))?
+            .input
+            .enqueue_control(bytes)
+            .context("failed to queue terminal control")
+    }
+
+    fn terminal(&self, id: u32) -> Option<Arc<ConPtyTerminal>> {
+        self.terminals
             .lock()
-            .to_anyhow()
-            .with_context(err_context)?
-            .get(&terminal_id)
-        {
-            Some(Some(term)) => {
-                let ok = unsafe { FlushFileBuffers(term.input_write_handle) };
-                if ok == 0 {
-                    // FlushFileBuffers can legitimately fail on pipe handles
-                    // (ERROR_INVALID_FUNCTION) — treat as non-fatal.
-                    let e = io::Error::last_os_error();
-                    log::debug!("FlushFileBuffers on terminal {}: {}", terminal_id, e);
-                }
-                Ok(())
-            },
-            _ => Err(anyhow!("no ConPTY terminal found for id {}", terminal_id))
-                .with_context(err_context),
-        }
+            .unwrap()
+            .get(&id)
+            .and_then(Clone::clone)
+    }
+
+    fn terminal_for_pid(&self, pid: u32) -> Option<Arc<ConPtyTerminal>> {
+        self.terminals
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .find(|term| term.child_pid == pid)
+            .cloned()
     }
 
     pub fn kill(&self, pid: u32) -> Result<()> {
-        terminate_process(pid).with_context(|| format!("failed to kill pid {}", pid))?;
+        if let Some(term) = self.terminal_for_pid(pid) {
+            term.job
+                .terminate()
+                .context("failed to terminate pane job")?;
+        } else {
+            terminate_process(pid).with_context(|| format!("failed to kill pid {}", pid))?;
+        }
         Ok(())
     }
 
     pub fn force_kill(&self, pid: u32) -> Result<()> {
-        terminate_process(pid).with_context(|| format!("failed to force-kill pid {}", pid))?;
-        Ok(())
+        self.kill(pid)
     }
 
     pub fn send_sigint(&self, pid: u32) -> Result<()> {
-        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid) };
-        if ok != 0 {
-            Ok(())
-        } else {
-            terminate_process(pid)
-                .with_context(|| format!("failed to send SIGINT to pid {}", pid))?;
-            Ok(())
-        }
+        let term = self
+            .terminal_for_pid(pid)
+            .ok_or_else(|| anyhow!("no pane for pid {}", pid))?;
+        term.input
+            .enqueue_control(b"\x03")
+            .context("failed to queue SIGINT")
     }
 
     pub fn reserve_terminal_id(&self, terminal_id: u32) {
-        self.terminals.lock().unwrap().insert(terminal_id, None);
+        let previous = self.terminals.lock().unwrap().insert(terminal_id, None);
+        if let Some(Some(previous)) = previous {
+            previous.close();
+        }
     }
 
     pub fn clear_terminal_id(&self, terminal_id: u32) {
-        self.terminals.lock().unwrap().remove(&terminal_id);
+        let previous = self.terminals.lock().unwrap().remove(&terminal_id);
+        if let Some(Some(previous)) = previous {
+            previous.close();
+        }
     }
 
     pub fn next_terminal_id(&self) -> Option<u32> {
@@ -696,6 +625,10 @@ impl WindowsPtyBackend {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "windows_conpty_tests.rs"]
+mod conpty_tests;
 
 #[cfg(test)]
 mod tests {

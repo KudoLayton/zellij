@@ -1880,6 +1880,21 @@ impl Pty {
         }
     }
 
+    #[cfg(windows)]
+    fn cancel_pending_input(&self, id: u32) -> Result<()> {
+        // Test buses may intentionally omit this thread. In production the
+        // acknowledgement orders queue removal before reusing the terminal ID.
+        if self.bus.senders.should_silently_fail && self.bus.senders.to_pty_writer.is_none() {
+            return Ok(());
+        }
+        let (reply, done) = zellij_utils::channels::bounded(1);
+        self.bus.senders.send_to_pty_writer(
+            crate::pty_writer::PtyWriteInstruction::CancelPending(id, reply),
+        )?;
+        done.recv_timeout(std::time::Duration::from_secs(2))
+            .context("timed out cancelling old terminal input")
+    }
+
     fn stop_terminal_reader(&mut self, id: u32) {
         if let Some(guard) = self.stream_guards.remove(&id) {
             guard.invalidate();
@@ -1912,6 +1927,10 @@ impl Pty {
         match id {
             PaneId::Terminal(id) => {
                 self.stop_terminal_reader(id);
+                #[cfg(windows)]
+                self.cancel_pending_input(id)
+                    .with_context(err_context)
+                    .non_fatal();
                 if let Some(child_pid) = self.id_to_child_pid.remove(&id) {
                     let err_context = || format!("failed to kill child processes for pane {id}");
                     self.bus
@@ -1996,6 +2015,8 @@ impl Pty {
                     run_command.originating_plugin = Some(originating_plugins.clone());
                 }
                 self.stop_terminal_reader(id);
+                #[cfg(windows)]
+                self.cancel_pending_input(id).with_context(err_context)?;
                 let _ = self.id_to_child_pid.remove(&id); // if all is wlel, this shouldn't be here
 
                 let hold_on_close = run_command.hold_on_close;

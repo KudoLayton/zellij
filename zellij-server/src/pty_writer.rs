@@ -14,6 +14,8 @@ use crate::thread_bus::Bus;
 #[derive(Debug, Clone)]
 pub enum PtyWriteInstruction {
     Write(Vec<u8>, u32, Option<NotificationEnd>),
+    #[cfg(windows)]
+    CancelPending(u32, channels::Sender<()>),
     ResizePty(u32, u16, u16, Option<u16>, Option<u16>),
     StartCachingResizes,
     ApplyCachedResizes,
@@ -24,6 +26,8 @@ impl From<&PtyWriteInstruction> for PtyWriteContext {
     fn from(tty_write_instruction: &PtyWriteInstruction) -> Self {
         match *tty_write_instruction {
             PtyWriteInstruction::Write(..) => PtyWriteContext::Write,
+            #[cfg(windows)]
+            PtyWriteInstruction::CancelPending(..) => PtyWriteContext::Write,
             PtyWriteInstruction::ResizePty(..) => PtyWriteContext::ResizePty,
             PtyWriteInstruction::ApplyCachedResizes => PtyWriteContext::ApplyCachedResizes,
             PtyWriteInstruction::StartCachingResizes => PtyWriteContext::StartCachingResizes,
@@ -32,7 +36,8 @@ impl From<&PtyWriteInstruction> for PtyWriteContext {
     }
 }
 
-/// Maximum pending bytes per terminal before dropping the buffer.
+/// Maximum pending bytes per terminal. On Windows reject the new chunk but
+/// retain the existing buffer: its head may own an outstanding overlapped write.
 ///
 /// Exposed (but not `pub`) so tests in this module can reference it.
 #[allow(dead_code)]
@@ -86,13 +91,16 @@ pub(crate) fn pty_writer_main(bus: Bus<PtyWriteInstruction>) -> Result<()> {
                         .sum();
                     if queued + bytes.len() > MAX_PENDING_BYTES {
                         log::error!(
-                            "dropping write buffer for terminal {} \
-                             ({} + {} bytes exceeds {} limit)",
+                            "input queue limit for terminal {} \
+                             ({} + {} bytes exceeds {} limit); rejecting incoming write",
                             terminal_id,
                             queued,
                             bytes.len(),
                             MAX_PENDING_BYTES,
                         );
+                        // Windows must keep polling the same request until the
+                        // worker acknowledges it; replacing it could replay input.
+                        #[cfg(not(windows))]
                         queue.clear();
                     } else {
                         queue.push_back(PendingWrite {
@@ -101,6 +109,11 @@ pub(crate) fn pty_writer_main(bus: Bus<PtyWriteInstruction>) -> Result<()> {
                             _completion: completion,
                         });
                     }
+                },
+                #[cfg(windows)]
+                PtyWriteInstruction::CancelPending(terminal_id, reply) => {
+                    pending.remove(&terminal_id);
+                    let _ = reply.send(());
                 },
                 PtyWriteInstruction::ResizePty(
                     terminal_id,

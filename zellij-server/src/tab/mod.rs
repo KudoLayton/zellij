@@ -4257,9 +4257,12 @@ impl Tab {
             }
         });
         if let Some(focus_event) = focus_event {
-            let _ = self
+            if let Err(error) = self
                 .os_api
-                .write_to_tty_stdin(terminal_id, focus_event.as_bytes());
+                .write_terminal_control(terminal_id, focus_event.as_bytes())
+            {
+                log::debug!("Could not queue host focus event: {error}");
+            }
         }
     }
     pub fn check_and_handle_bell_notifications(

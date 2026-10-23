@@ -326,6 +326,66 @@ fn memory_cap_drops_buffer_when_exceeded() {
     );
 }
 
+#[cfg(windows)]
+fn wait_for_written(mock: &MockServerOsApi, terminal: u32, expected: &[u8]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while mock.get_written_bytes(terminal) != expected {
+        assert!(std::time::Instant::now() < deadline, "writer test deadline");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn overflow_retains_the_outstanding_windows_request() {
+    let mock = MockServerOsApi::new();
+    mock.set_behavior(1, WriteBehavior::AcceptNone);
+    let (bus, sender) = make_test_bus(mock.clone());
+    let worker = std::thread::spawn(move || pty_writer_main(bus).unwrap());
+    sender
+        .send(PtyWriteInstruction::Write(b"head".to_vec(), 1, None))
+        .unwrap();
+    sender
+        .send(PtyWriteInstruction::Write(
+            vec![b'x'; MAX_PENDING_BYTES + 1],
+            1,
+            None,
+        ))
+        .unwrap();
+    sender
+        .send(PtyWriteInstruction::Write(b"barrier".to_vec(), 2, None))
+        .unwrap();
+    wait_for_written(&mock, 2, b"barrier");
+    mock.set_behavior(1, WriteBehavior::AcceptAll);
+    wait_for_written(&mock, 1, b"head");
+    sender.send(PtyWriteInstruction::Exit).unwrap();
+    worker.join().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn cancellation_barrier_discards_old_input_before_terminal_id_reuse() {
+    let mock = MockServerOsApi::new();
+    mock.set_behavior(1, WriteBehavior::AcceptNone);
+    let (bus, sender) = make_test_bus(mock.clone());
+    let worker = std::thread::spawn(move || pty_writer_main(bus).unwrap());
+    sender
+        .send(PtyWriteInstruction::Write(b"old".to_vec(), 1, None))
+        .unwrap();
+    let (reply, done) = channels::bounded(1);
+    sender
+        .send(PtyWriteInstruction::CancelPending(1, reply))
+        .unwrap();
+    done.recv_timeout(Duration::from_secs(3)).unwrap();
+    mock.set_behavior(1, WriteBehavior::AcceptAll);
+    sender
+        .send(PtyWriteInstruction::Write(b"new".to_vec(), 1, None))
+        .unwrap();
+    wait_for_written(&mock, 1, b"new");
+    sender.send(PtyWriteInstruction::Exit).unwrap();
+    worker.join().unwrap();
+}
+
 #[test]
 fn write_error_clears_terminal_queue() {
     let mock = MockServerOsApi::new();

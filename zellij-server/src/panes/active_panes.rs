@@ -119,18 +119,24 @@ impl ActivePanes {
     fn unfocus_pane(&self, pane_id: PaneId, panes: &mut BTreeMap<PaneId, Box<dyn Pane>>) {
         if let PaneId::Terminal(terminal_id) = pane_id {
             if let Some(focus_event) = panes.get(&pane_id).and_then(|p| p.unfocus_event()) {
-                let _ = self
+                if let Err(error) = self
                     .os_api
-                    .write_to_tty_stdin(terminal_id, focus_event.as_bytes());
+                    .write_terminal_control(terminal_id, focus_event.as_bytes())
+                {
+                    log::debug!("Could not queue pane unfocus event: {error}");
+                }
             }
         }
     }
     fn focus_pane(&self, pane_id: PaneId, panes: &mut BTreeMap<PaneId, Box<dyn Pane>>) {
         if let PaneId::Terminal(terminal_id) = pane_id {
             if let Some(focus_event) = panes.get(&pane_id).and_then(|p| p.focus_event()) {
-                let _ = self
+                if let Err(error) = self
                     .os_api
-                    .write_to_tty_stdin(terminal_id, focus_event.as_bytes());
+                    .write_terminal_control(terminal_id, focus_event.as_bytes())
+                {
+                    log::debug!("Could not queue pane focus event: {error}");
+                }
             }
         }
     }
