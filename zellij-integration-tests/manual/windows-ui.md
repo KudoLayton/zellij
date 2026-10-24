@@ -1,12 +1,12 @@
 # Windows 터미널 수동 검사
 
-실제 IME 조합과 화면 표시는 자동 ConPTY 테스트만으로 확인할 수 없습니다. 아래 **6개 조합**을 하나씩 검사합니다. 6개 조합 전체 검증은 아직 미완료입니다. WT의 세 셸에서 detach/quit 후 입력 모드 `487→480` 문제가 확인됐습니다. 수정본은 kernel 회귀 검사와 Windows 전체 workspace 검사 두 변형을 통과했으며, 아래 경로로 실제 UI를 재검사합니다. 최초 실행의 pwsh 경로 중복 오류도 `$PSHOME/pwsh.exe` 단일 경로로 수정했습니다.
+실제 IME 조합과 화면 표시는 자동 ConPTY 테스트만으로 확인할 수 없습니다. 최초 검사 계획은 아래 **6개 조합**이었습니다. 사용자는 후속 결정에서 **WT 세 셸까지만 완료 범위로 확정**했습니다. native 검사는 이번 범위에서 제외했으며 미검증으로 남깁니다. WT의 세 셸에서 detach/quit 후 입력 모드 `487→480` 문제가 확인됐습니다. 수정본은 kernel 회귀 검사와 Windows 전체 workspace 검사 두 변형을 통과했고, 실제 WT 재검사에서 원복을 확인했습니다. 아래는 검사 재현용 절차입니다. 최초 실행의 pwsh 경로 중복 오류도 `$PSHOME/pwsh.exe` 단일 경로로 수정했습니다.
 
 | 셸 (`-Shell`) | Windows Terminal (`wt`) | native console (`native`) |
 | --- | --- | --- |
-| `pwsh` | 수정본 detach/quit mode·CP 복원 확인, 나머지 시각 항목 확인 대기 | 미검증 |
-| `cmd` | 사용자 정상 동작 확인, 복원 확인; paste fixture 오류는 비차단 승인 | 미검증 |
-| `winps-cooked` | 수정본 detach/quit mode·CP 복원 확인, 나머지 시각 항목 확인 대기 | 미검증 |
+| `pwsh` | 사용자 입력·시각 항목 정상 확인, detach/quit mode·CP 복원 확인 | 미검증 / 이번 범위 제외 |
+| `cmd` | 사용자 정상 확인, 복원 확인; paste fixture 오류는 비차단 승인 | 미검증 / 이번 범위 제외 |
+| `winps-cooked` | 사용자 입력·시각 항목 정상 확인, detach/quit mode·CP 복원 확인 | 미검증 / 이번 범위 제외 |
 
 `winps-cooked`는 해당 자식 프로세스에서만 PSReadLine을 제거합니다. PowerShell 5.1 + PSReadLine 2.4.5의 이모지 입력 실패는 별도의 알려진 제약이며, 이 검사가 그 문제를 해결했다고 의미하지 않습니다.
 
@@ -14,9 +14,9 @@
 
 기존 창/프로필을 수정하지 않고 새 창에서 실행합니다. **dot-source하지 마세요.** 관리자 권한은 필요 없습니다. `-Terminal`은 실제 호스트를 생성하지 않으므로 아래 명령으로 호스트를 선택해야 합니다.
 
-**현재 Cargo 설치 파일은 사용 중이라 교체하지 못했습니다.** 아래 명령의 `-Binary`는 worktree release를 직접 지정합니다. 현재는 기존 설치와 같은 기본 feature 및 두 실행 파일 구성으로 재빌드 중이므로 **새 검사는 빌드 완료 안내 후** 실행하세요.
+**기본 feature 수정본의 사용자 Cargo 설치가 완료됐습니다.** `zellij.exe`와 `zellij-window.exe`가 모두 설치됐고 각각 빌드 파일과 해시가 일치합니다. 아래 `-Binary`는 같은 worktree release를 지정합니다. 최종 CLI SHA256: `84CE635F073C8404CD2C2F6D0D3F1BF4B09B0D5984F752771A5F1DC37064422F`.
 
-WT에서 확인한 이전 후보는 no-default 빌드이며 SHA256 `9F55CA9198D6A15365D054B201EC2606016814F92A4BA510D8945B7FF4C2ADD8`입니다. 이 정확한 후보는 `D:/Git/zw/target/ui-artifacts/zellij-no-default-9f55ca.exe`에 보존했습니다. 아래 release 경로는 새 기본 feature 빌드로 교체될 예정입니다.
+사용자가 WT에서 확인한 후보는 no-default 빌드이며 SHA256 `9F55CA9198D6A15365D054B201EC2606016814F92A4BA510D8945B7FF4C2ADD8`입니다. 이 정확한 후보는 `D:/Git/zw/target/ui-artifacts/zellij-no-default-9f55ca.exe`에 보존했습니다. 최종 기본 feature 빌드는 빌드·CLI·해시 검증을 통과했으며, 이전 후보의 사용자 관찰을 최종 실행 파일의 별도 UI 재검사로 계산하지 않습니다.
 
 ```powershell
 # Windows Terminal / PowerShell 7
@@ -81,7 +81,7 @@ pwsh.exe -NoProfile -File check-paste.ps1
 - cmd: `%TEMP%/zw-ui-2d8604968e17`
 - winps-cooked: `%TEMP%/zw-ui-ba2c1bebe264`
 
-cmd의 `check-paste.ps1`은 `pasted.txt`가 없어 실패했습니다. 사용자는 cmd가 잘 동작하는 것으로 간주하고 이 검사 문제를 일단 넘어가기로 승인했습니다. 원인은 확정하지 않았으며 자동 붙여넣기 검사의 통과로 계산하지 않습니다. native 및 다른 시각 항목의 전체 확인은 별도로 필요합니다.
+cmd의 `check-paste.ps1`은 `pasted.txt`가 없어 실패했습니다. 사용자는 cmd가 잘 동작하는 것으로 간주하고 이 검사 문제를 일단 넘어가기로 승인했습니다. 원인은 확정하지 않았으며 자동 붙여넣기 검사의 통과로 계산하지 않습니다. 사용자는 WT 세 셸의 나머지 입력·시각 항목도 정상으로 확인했습니다. native는 이번 완료 범위에서 제외했으므로 통과를 주장하지 않습니다. 아래 native 절차는 향후 선택적 검사에 사용할 수 있습니다.
 
 ## 결과 전달
 
