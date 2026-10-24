@@ -175,6 +175,61 @@ async fn unicode_input_roundtrip(shell: &str, args: &[&str], cmd: bool, expected
 }
 
 #[tokio::test]
+#[ignore = "optional PowerShell 7 host-mode diagnostic; no Zellij client is launched"]
+async fn pwsh_native_command_console_mode_baseline() {
+    let directory = tempfile::tempdir().unwrap();
+    let script = directory.path().join("baseline.ps1");
+    let result = directory.path().join("baseline.json");
+    std::fs::write(
+        &script,
+        r#"Add-Type @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class BaselineConsole {
+    [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int which);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetConsoleMode(IntPtr h, out uint mode);
+    public static uint Mode(int which) {
+        uint mode;
+        if (!GetConsoleMode(GetStdHandle(which), out mode)) throw new Win32Exception();
+        return mode;
+    }
+}
+'@
+Write-Host 'BASELINE_READY'
+$null = Read-Host 'start'
+$before = [BaselineConsole]::Mode(-10)
+& $env:ComSpec /d /c exit 0
+$after = [BaselineConsole]::Mode(-10)
+[IO.File]::WriteAllText($env:ZELLIJ_CONSOLE_BASELINE_PATH, (@{before=$before; after=$after} | ConvertTo-Json))
+"#,
+    )
+    .unwrap();
+    let mut env = PaneEnv::default();
+    env.insert(
+        "ZELLIJ_CONSOLE_BASELINE_PATH".into(),
+        Some(result.display().to_string()),
+    );
+    let mut pane = Pane::spawn(
+        "pwsh.exe",
+        &["-NoLogo", "-NoProfile", "-File", script.to_str().unwrap()],
+        env,
+    );
+    pane.until(b"BASELINE_READY").await;
+    pane.write(b"\r").await;
+    pane.eof().await;
+    assert_eq!(
+        pane.exit.recv_timeout(Duration::from_secs(3)).unwrap(),
+        Some(0)
+    );
+    let observation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+    assert!(observation["before"].as_u64().is_some());
+    assert!(observation["after"].as_u64().is_some());
+    eprintln!("PowerShell native no-op input modes (no Zellij): {observation}");
+}
+
+#[tokio::test]
 async fn cmd_unicode_input_survives_split_utf8() {
     unicode_input_roundtrip("cmd.exe", &["/d", "/q"], true, "한글😀끝").await;
 }
@@ -191,7 +246,7 @@ async fn windows_powershell_hangul_input_survives_split_utf8() {
 }
 
 #[tokio::test]
-#[ignore = "PSReadLine 2.0 drops non-BMP key input; run with an updated PSReadLine"]
+#[ignore = "known Windows PowerShell 5.1 non-BMP limitation; explicit compatibility probe"]
 async fn windows_powershell_legacy_readline_non_bmp_compatibility() {
     unicode_input_roundtrip(
         "powershell.exe",
@@ -200,6 +255,36 @@ async fn windows_powershell_legacy_readline_non_bmp_compatibility() {
         "한글😀끝",
     )
     .await;
+}
+
+#[tokio::test]
+#[ignore = "set ZELLIJ_TEST_PSREADLINE_MANIFEST to a compatible PSReadLine 2.4.5+ manifest"]
+async fn windows_powershell_selected_readline_unicode_survives_split_utf8() {
+    let manifest = std::env::var("ZELLIJ_TEST_PSREADLINE_MANIFEST")
+        .expect("provide an explicit PSReadLine manifest; user modules are not changed");
+    assert!(std::path::Path::new(&manifest).is_file());
+    let directory = tempfile::tempdir().unwrap();
+    let version_file = directory.path().join("version.txt");
+    let setup = format!(
+        "$ErrorActionPreference='Stop'; Import-Module '{}' -Force; \
+         $v=(Get-Module PSReadLine).Version; \
+         if ($PSVersionTable.PSVersion.Major -ne 5 -or $v -lt [version]'2.4.5') {{ throw 'unexpected host/module version' }}; \
+         Set-PSReadLineOption -HistorySaveStyle SaveNothing -PredictionSource None; \
+         [IO.File]::WriteAllText('{}',$v.ToString())",
+        manifest.replace('\'', "''"),
+        version_file.display().to_string().replace('\'', "''"),
+    );
+    for text in ["한글끝", "한글😀끝"] {
+        unicode_input_roundtrip(
+            "powershell.exe",
+            &["-NoLogo", "-NoProfile", "-NoExit", "-Command", &setup],
+            false,
+            text,
+        )
+        .await;
+        let version = std::fs::read_to_string(&version_file).unwrap();
+        eprintln!("Windows PowerShell 5.1 / PSReadLine {version}: {text} roundtrip passed");
+    }
 }
 
 #[tokio::test]
