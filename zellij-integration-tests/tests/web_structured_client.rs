@@ -406,9 +406,9 @@ fn a_structured_client_types_resizes_and_detaches_over_the_control_socket() {
     runtime.block_on(client.send_control(serde_json::json!({ "type": "Detach" })));
     let (exit, seen_control_types) = runtime.block_on(client.control_message_named("Exit"));
     assert_eq!(
-        exit["reason"], "Normal",
-        "a window is told why it left, in the same words a unix-socket client is told \
-         (DetachSession sends ExitReason::Normal, zellij-server/src/lib.rs:1526), got {:?}",
+        exit["reason"], "NormalDetached",
+        "a window receives the distinct normal-detachment reason, matching local IPC \
+         (DetachSession sends ExitReason::NormalDetached), got {:?}",
         exit
     );
 
