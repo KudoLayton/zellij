@@ -772,12 +772,13 @@ mod tests {
 
     #[test]
     fn a_watcher_attaches_read_only_and_declares_structured_rendering() {
-        let server = FakeServer::spawn(|side| side.expect(2));
+        let server = FakeServer::spawn_deferred(|side| side.expect(2));
         let connection = watch_at(&server.path, test_geometry()).unwrap();
         assert_eq!(connection.role, Role::Watcher);
-        drop(connection);
-
+        // Keep the reply pipe alive until the fake server has accepted it and
+        // read the handshake; an early Windows disconnect can restart accept.
         let received = server.finish();
+        drop(connection);
         assert_eq!(
             received,
             vec![
@@ -792,12 +793,12 @@ mod tests {
 
     #[test]
     fn a_watcher_leaves_with_a_key_because_the_detach_action_is_ignored_for_watchers() {
-        let server = FakeServer::spawn(|side| side.expect(3));
+        let server = FakeServer::spawn_deferred(|side| side.expect(3));
         let connection = watch_at(&server.path, test_geometry()).unwrap();
         request_detach(&connection.sender, connection.role).unwrap();
-        drop(connection);
-
+        // Do not drop the reply pipe while the server may still be accepting it.
         let received = server.finish();
+        drop(connection);
         assert!(
             matches!(
                 received.last().unwrap(),
