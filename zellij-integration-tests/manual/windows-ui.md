@@ -1,12 +1,12 @@
 # Windows 터미널 수동 검사
 
-실제 IME 조합과 화면 표시는 자동 ConPTY 테스트만으로 확인할 수 없습니다. 아래 **6개 조합**을 하나씩 검사합니다. 아직 최종 통과한 조합은 없습니다. WT의 세 셸에서 detach/quit 후 입력 모드 `487→480` 문제가 확인됐습니다. 수정본은 kernel 회귀 검사와 Windows 전체 workspace 검사 두 변형을 통과했으며, 아래 경로로 실제 UI를 재검사합니다. 최초 실행의 pwsh 경로 중복 오류도 `$PSHOME/pwsh.exe` 단일 경로로 수정했습니다.
+실제 IME 조합과 화면 표시는 자동 ConPTY 테스트만으로 확인할 수 없습니다. 아래 **6개 조합**을 하나씩 검사합니다. 6개 조합 전체 검증은 아직 미완료입니다. WT의 세 셸에서 detach/quit 후 입력 모드 `487→480` 문제가 확인됐습니다. 수정본은 kernel 회귀 검사와 Windows 전체 workspace 검사 두 변형을 통과했으며, 아래 경로로 실제 UI를 재검사합니다. 최초 실행의 pwsh 경로 중복 오류도 `$PSHOME/pwsh.exe` 단일 경로로 수정했습니다.
 
 | 셸 (`-Shell`) | Windows Terminal (`wt`) | native console (`native`) |
 | --- | --- | --- |
-| `pwsh` | 화면 복원 관찰 / 입력 mode 불일치, 재검사 필요 | 미검증 |
-| `cmd` | 입력 mode 불일치 / 구 paste 절차 오류, 재검사 필요 | 미검증 |
-| `winps-cooked` | 화면 복원 관찰 / 입력 mode 불일치, 재검사 필요 | 미검증 |
+| `pwsh` | 수정본 detach/quit mode·CP 복원 확인, 나머지 시각 항목 확인 대기 | 미검증 |
+| `cmd` | 사용자 정상 동작 확인, 복원 확인; paste fixture 오류는 비차단 승인 | 미검증 |
+| `winps-cooked` | 수정본 detach/quit mode·CP 복원 확인, 나머지 시각 항목 확인 대기 | 미검증 |
 
 `winps-cooked`는 해당 자식 프로세스에서만 PSReadLine을 제거합니다. PowerShell 5.1 + PSReadLine 2.4.5의 이모지 입력 실패는 별도의 알려진 제약이며, 이 검사가 그 문제를 해결했다고 의미하지 않습니다.
 
@@ -14,7 +14,9 @@
 
 기존 창/프로필을 수정하지 않고 새 창에서 실행합니다. **dot-source하지 마세요.** 관리자 권한은 필요 없습니다. `-Terminal`은 실제 호스트를 생성하지 않으므로 아래 명령으로 호스트를 선택해야 합니다.
 
-**현재 Cargo 설치 파일은 사용 중이라 교체하지 못했습니다.** 아래 명령의 `-Binary`는 검증된 새 release를 직접 지정합니다. SHA256: `9F55CA9198D6A15365D054B201EC2606016814F92A4BA510D8945B7FF4C2ADD8`.
+**현재 Cargo 설치 파일은 사용 중이라 교체하지 못했습니다.** 아래 명령의 `-Binary`는 worktree release를 직접 지정합니다. 현재는 기존 설치와 같은 기본 feature 및 두 실행 파일 구성으로 재빌드 중이므로 **새 검사는 빌드 완료 안내 후** 실행하세요.
+
+WT에서 확인한 이전 후보는 no-default 빌드이며 SHA256 `9F55CA9198D6A15365D054B201EC2606016814F92A4BA510D8945B7FF4C2ADD8`입니다. 이 정확한 후보는 `D:/Git/zw/target/ui-artifacts/zellij-no-default-9f55ca.exe`에 보존했습니다. 아래 release 경로는 새 기본 feature 빌드로 교체될 예정입니다.
 
 ```powershell
 # Windows Terminal / PowerShell 7
@@ -69,7 +71,17 @@ pwsh.exe -NoProfile -File check-paste.ps1
 
 결과가 `True`여야 합니다. ASCII+한글+emoji와 echo의 CRLF까지 비교합니다. 이 수정된 명령/파일 비교는 별도로 자동 확인했지만, 실제 터미널 붙여넣기 동작의 통과를 대신하지 않습니다.
 
-문자열은 ASCII 3840자 + `한글😀끝`이며 UTF-8로 3853바이트입니다. 실제 붙여넣기 중 UI가 멈추거나 내용이 잘리면 실패입니다. 4MiB 정체/취소 처리는 별도 자동 테스트로 검증합니다.
+문자열은 ASCII 4096자 + `한글😀끝`이며 UTF-8로 4109바이트입니다. UTF-16 길이는 4101이며, cmd의 CRLF를 포함한 비교 길이는 4103입니다. 실제 붙여넣기 중 UI가 멈추거나 내용이 잘리면 실패입니다. 4MiB 정체/취소 처리는 별도 자동 테스트로 검증합니다.
+
+## 현재 관찰 기록
+
+수정 release(`9F55CA...`)의 WT 검사에서 세 셸 모두 detach/quit가 exit 0, `restored=true`였습니다. 입력 mode 487, 출력 mode 7, 입출력 code page 65001이 그대로 유지됐습니다.
+
+- pwsh: `%TEMP%/zw-ui-0153c6f6e7ff`
+- cmd: `%TEMP%/zw-ui-2d8604968e17`
+- winps-cooked: `%TEMP%/zw-ui-ba2c1bebe264`
+
+cmd의 `check-paste.ps1`은 `pasted.txt`가 없어 실패했습니다. 사용자는 cmd가 잘 동작하는 것으로 간주하고 이 검사 문제를 일단 넘어가기로 승인했습니다. 원인은 확정하지 않았으며 자동 붙여넣기 검사의 통과로 계산하지 않습니다. native 및 다른 시각 항목의 전체 확인은 별도로 필요합니다.
 
 ## 결과 전달
 
