@@ -250,7 +250,8 @@ pub(crate) fn enable_mouse_support(stdout: &mut dyn Write) -> Result<()> {
 /// On the VT path, `enable_vt_input()` sets ENABLE_MOUSE_INPUT and
 /// ENABLE_VIRTUAL_TERMINAL_INPUT on the console handle, but crossterm's
 /// `disable_raw_mode()` never clears them.  This function restores the
-/// original console mode saved before those flags were set.
+/// original console mode saved before raw mode or mouse setup changed any flags.
+/// The same full-mode restoration also applies to the native-console input path.
 pub(crate) fn restore_console_mode() {
     restore_vt_input();
 }

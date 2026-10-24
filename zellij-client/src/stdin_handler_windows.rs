@@ -12,11 +12,31 @@ use zellij_utils::channels::SenderWithContext;
 use zellij_utils::input::{cast_crossterm_key, from_crossterm_mouse};
 use zellij_utils::vendored::termwiz::input::InputEvent;
 
-/// Saved console input mode from before `enable_vt_input()` modified it.
-/// Used by `restore_vt_input()` to put the console back the way the shell
-/// left it, clearing flags like ENABLE_MOUSE_INPUT that crossterm's
-/// disable_raw_mode() does not touch.
+/// Input mode before raw or mouse setup, for both VT and native input paths.
+/// Capturing it in `enable_vt_input()` alone is too late: raw mode has already
+/// cleared PROCESSED_INPUT, LINE_INPUT and ECHO_INPUT at that point.
 static ORIGINAL_CONSOLE_MODE: OnceLock<u32> = OnceLock::new();
+
+pub(crate) fn save_console_mode() -> std::io::Result<()> {
+    if ORIGINAL_CONSOLE_MODE.get().is_some() {
+        return Ok(());
+    }
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "console input handle is unavailable",
+            ));
+        }
+        let mut mode = 0;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let _ = ORIGINAL_CONSOLE_MODE.set(mode);
+    }
+    Ok(())
+}
 
 /// Set the stdin console mode for raw VT input.
 ///
@@ -27,17 +47,15 @@ static ORIGINAL_CONSOLE_MODE: OnceLock<u32> = OnceLock::new();
 /// ENABLE_QUICK_EDIT_MODE are always cleared — that flag intercepts mouse
 /// events at the console level, breaking application mouse support.
 pub(crate) fn enable_vt_input() -> bool {
+    // Normally already saved before raw mode; also support standalone VT setup.
+    if save_console_mode().is_err() {
+        return false;
+    }
     unsafe {
         let handle = GetStdHandle(STD_INPUT_HANDLE);
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return false;
         }
-        let mut mode: u32 = 0;
-        if GetConsoleMode(handle, &mut mode) == 0 {
-            return false;
-        }
-        // Save the original mode so we can restore it on exit.
-        let _ = ORIGINAL_CONSOLE_MODE.set(mode);
         // Explicitly set the mode we need rather than read-modify-write.
         // This eliminates the race with crossterm's EnableMouseCapture which
         // also calls GetConsoleMode/SetConsoleMode concurrently.
@@ -66,7 +84,7 @@ pub(crate) fn enable_vt_input() -> bool {
     }
 }
 
-/// Restore the console input mode that was saved by `enable_vt_input()`.
+/// Restore the full input mode saved before raw mode, after disabling raw mode.
 ///
 /// `crossterm::terminal::disable_raw_mode()` only adds back LINE_INPUT,
 /// ECHO_INPUT and PROCESSED_INPUT — it never clears ENABLE_MOUSE_INPUT or
@@ -87,6 +105,10 @@ pub(crate) fn restore_vt_input() {
 #[cfg(test)]
 #[path = "native_input_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "console_mode_tests.rs"]
+mod console_mode_tests;
 
 fn native_key_instruction(event: crossterm::event::KeyEvent) -> Option<InputInstruction> {
     if event.kind != KeyEventKind::Press {

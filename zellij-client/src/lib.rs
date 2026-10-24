@@ -972,8 +972,8 @@ pub fn start_remote_client(
         Box::new(move |info| {
             terminal_cleanup.run_once(|| {
                 os_input.disable_mouse().non_fatal();
-                os_input.restore_console_mode();
                 let _ = os_input.unset_raw_mode();
+                os_input.restore_console_mode();
                 handle_panic::<ClientInstruction>(info, None);
             });
         })
@@ -1326,8 +1326,8 @@ pub fn start_client(
             Box::new(move |info| {
                 terminal_cleanup.run_once(|| {
                     os_input.disable_mouse().non_fatal();
-                    os_input.restore_console_mode();
                     let _ = os_input.unset_raw_mode();
+                    os_input.restore_console_mode();
                     handle_panic(info, Some(&send_client_instructions));
                 });
             })

@@ -217,6 +217,9 @@ impl ClientOsApi for ClientOsInputOutput {
         get_terminal_size()
     }
     fn set_raw_mode(&mut self) {
+        #[cfg(windows)]
+        crate::stdin_handler_windows::save_console_mode()
+            .expect("could not save console input mode");
         crossterm::terminal::enable_raw_mode().expect("could not enable raw mode");
     }
     fn unset_raw_mode(&self) -> Result<(), std::io::Error> {
