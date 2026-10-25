@@ -1,5 +1,7 @@
 # Windows stability integration
 
+Optional graphics transport work is tracked separately: [side-by-side ConPTY installation and rollback](docs/windows-conpty.md), [diagnostic evidence and remaining UI checks](windows-graphics-diagnostic.md). The stability results below predate that opt-in provider.
+
 Status: completed within the user-approved validation scope; the corrected default-feature build is installed. Accepted limitations remain documented below; this is not a claim of a fully green Linux integration suite or native-console UI verification.
 
 Scope decision: after the core integration, the user approved follow-up watcher, PSReadLine, Windows UI, and Linux default-feature validation. The latest follow-up below supersedes earlier outstanding-item lists. User profiles/modules remain unchanged. The user explicitly accepted the reproduced PowerShell 5.1 non-BMP limitation, chose assisted manual Windows UI verification, and authorized the WSL desktop-test packages.
