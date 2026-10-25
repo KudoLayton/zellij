@@ -1,4 +1,6 @@
 //! Real Windows kernel/ConPTY regressions. No external terminal UI required.
+#[path = "windows_graphics_diagnostics.rs"]
+mod graphics_diagnostics;
 use super::*;
 use std::time::Duration;
 
