@@ -1,6 +1,5 @@
 ---
 source: zellij-utils/src/setup.rs
-assertion_line: 979
 expression: "format!(\"{:#?}\", config)"
 ---
 Config {
@@ -6775,6 +6774,7 @@ Config {
         session_indicator: None,
         swap_layout_notification: None,
         on_quit: None,
+        conpty_provider: None,
     },
     themes: {},
     plugins: PluginAliases {

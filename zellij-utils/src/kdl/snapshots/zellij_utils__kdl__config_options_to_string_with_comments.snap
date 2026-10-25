@@ -418,3 +418,7 @@ web_sharing "disabled"
 //   - "detach" (detach without asking)
 // 
 // on_quit "ask_quit"
+
+// Windows only: system (default) or bundled (requires an installed trusted ConPTY pair).
+// Applies to new sessions only; ignored on other platforms.
+// conpty_provider "system"

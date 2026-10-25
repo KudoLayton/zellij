@@ -1143,6 +1143,9 @@ impl From<crate::input::options::Options>
             session_indicator: options.session_indicator,
             swap_layout_notification: options.swap_layout_notification,
             on_quit: options.on_quit.map(|on_quit| on_quit.as_str().to_owned()),
+            conpty_provider: options
+                .conpty_provider
+                .map(|provider| provider.as_str().to_owned()),
             show_startup_tips: options.show_startup_tips,
             show_release_notes: options.show_release_notes,
             advanced_mouse_actions: options.advanced_mouse_actions,
@@ -1292,6 +1295,14 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             dangerously_enable_paste_buffer_read: options.dangerously_enable_paste_buffer_read,
             session_indicator: options.session_indicator,
             swap_layout_notification: options.swap_layout_notification,
+            conpty_provider: options
+                .conpty_provider
+                .map(|provider| {
+                    provider
+                        .parse::<crate::input::options::ConptyProvider>()
+                        .map_err(|e| anyhow!(e))
+                })
+                .transpose()?,
             on_quit: options
                 .on_quit
                 .map(|on_quit| {

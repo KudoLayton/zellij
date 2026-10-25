@@ -10,6 +10,38 @@ use std::net::IpAddr;
 
 pub const DEFAULT_WORD_SEPARATORS: &str = "[]{}<>()";
 
+/// Windows PTY implementation, selected once when a server starts its session.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ConptyProvider {
+    #[default]
+    System,
+    Bundled,
+}
+
+impl ConptyProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Bundled => "bundled",
+        }
+    }
+}
+
+impl FromStr for ConptyProvider {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "system" => Ok(Self::System),
+            "bundled" => Ok(Self::Bundled),
+            _ => Err(format!(
+                "Invalid conpty_provider: '{value}' (expected system or bundled)"
+            )),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Deserialize, Serialize, ValueEnum)]
 pub enum OnForceClose {
     #[serde(alias = "quit")]
@@ -557,6 +589,12 @@ pub struct Options {
     )]
     #[serde(default)]
     pub on_quit: Option<OnQuit>,
+
+    /// Windows ConPTY provider (system or bundled). Applies to new sessions only.
+    /// Ignored on non-Windows hosts.
+    #[clap(long, value_enum)]
+    #[serde(default)]
+    pub conpty_provider: Option<ConptyProvider>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -828,6 +866,7 @@ impl Options {
             session_indicator,
             swap_layout_notification,
             on_quit,
+            conpty_provider: other.conpty_provider.or(self.conpty_provider),
         }
     }
 
@@ -1034,6 +1073,7 @@ impl Options {
             session_indicator,
             swap_layout_notification,
             on_quit,
+            conpty_provider: other.conpty_provider.or(self.conpty_provider),
         }
     }
 
@@ -1049,6 +1089,35 @@ impl Options {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conpty_provider_merges_without_losing_explicit_system() {
+        let configured = Options {
+            conpty_provider: Some(ConptyProvider::Bundled),
+            ..Default::default()
+        };
+        let override_options = Options {
+            conpty_provider: Some(ConptyProvider::System),
+            ..Default::default()
+        };
+        assert_eq!(
+            configured.merge(Options::default()).conpty_provider,
+            Some(ConptyProvider::Bundled)
+        );
+        assert_eq!(
+            configured.merge_from_cli(Options::default()).conpty_provider,
+            Some(ConptyProvider::Bundled)
+        );
+        assert_eq!(
+            configured.merge(override_options.clone()).conpty_provider,
+            Some(ConptyProvider::System)
+        );
+        assert_eq!(
+            configured.merge_from_cli(override_options).conpty_provider,
+            Some(ConptyProvider::System)
+        );
+        assert_eq!(Options::default().conpty_provider, None);
+    }
 
     #[test]
     fn pane_frame_style_from_str_accepts_all_variants() {

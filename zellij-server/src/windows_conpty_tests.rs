@@ -28,6 +28,14 @@ impl Pane {
                 &env,
             )
             .unwrap();
+        if let Ok(expected) = std::env::var("ZELLIJ_TEST_CONPTY_EXPECT") {
+            let terminal = backend.terminal(1).unwrap();
+            assert_eq!(
+                terminal.console.lock().unwrap().is_bundled(),
+                expected == "bundled",
+                "unexpected ConPTY provider (a fallback must not silently pass the bundled suite)"
+            );
+        }
         Self {
             backend,
             reader,
@@ -450,12 +458,21 @@ async fn stalled_conpty_input_keeps_other_panes_responsive_and_close_cancels_it(
         .unwrap();
     let bytes = tokio::time::timeout(Duration::from_secs(3), async {
         let mut bytes = Vec::new();
+        let mut answered_da1 = false;
         loop {
             let chunk = second.read_chunk(8192).await.unwrap();
             if chunk.is_empty() {
                 break bytes;
             }
             bytes.extend(chunk);
+            // ConPTY 1.22 waits up to 3s for startup DA1. A real Zellij grid
+            // answers it; model that host here without relaxing the deadline.
+            if !answered_da1 && bytes.windows(3).any(|w| w == b"\x1b[c") {
+                pane.backend
+                    .write_terminal_control(2, b"\x1b[?62;4;52c")
+                    .unwrap();
+                answered_da1 = true;
+            }
         }
     })
     .await
@@ -472,6 +489,46 @@ async fn stalled_conpty_input_keeps_other_panes_responsive_and_close_cancels_it(
 fn sigint_unknown_pid_does_not_force_terminate() {
     let backend = WindowsPtyBackend::new().unwrap();
     assert!(backend.send_sigint(u32::MAX).is_err());
+}
+
+#[test]
+fn configured_provider_is_frozen_across_backend_clones() {
+    let backend = WindowsPtyBackend::new().unwrap();
+    let clone = backend.clone();
+    assert!(backend.provider.get().is_none());
+    backend.configure_provider(Some(zellij_utils::input::options::ConptyProvider::System));
+    let provider = backend.provider();
+    clone.configure_provider(Some(zellij_utils::input::options::ConptyProvider::Bundled));
+    assert!(Arc::ptr_eq(&provider, &clone.provider()));
+    assert!(Arc::ptr_eq(&provider, &backend.provider()));
+}
+
+#[tokio::test]
+async fn resize_reaches_child_and_close_remains_idempotent() {
+    let mut pane = Pane::spawn("powershell.exe", &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+        "[Console]::WriteLine('resize-ready'); $null=[Console]::ReadLine(); [Console]::WriteLine('SIZE=' + [Console]::WindowWidth + ',' + [Console]::WindowHeight)"], PaneEnv::default());
+    pane.until(b"resize-ready").await;
+    pane.backend
+        .set_terminal_size(1, 101, 37, None, None)
+        .unwrap();
+    pane.write(b"\r\n").await;
+    let output = pane.eof().await;
+    assert!(
+        String::from_utf8_lossy(&output).contains("SIZE=101,37"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        pane.exit.recv_timeout(Duration::from_secs(3)).unwrap(),
+        Some(0)
+    );
+    // Natural exit already closed the HPCON; repeated teardown must not call a
+    // different provider (or close the handle twice).
+    pane.backend
+        .set_terminal_size(1, 80, 24, None, None)
+        .unwrap();
+    pane.backend.clear_terminal_id(1);
+    pane.backend.clear_terminal_id(1);
 }
 
 #[test]

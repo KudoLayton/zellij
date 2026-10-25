@@ -9,12 +9,14 @@ use std::{
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
 };
 
 #[path = "windows_conpty.rs"]
 mod windows_conpty;
+#[path = "windows_conpty_provider.rs"]
+mod windows_conpty_provider;
 #[path = "windows_conpty_reader.rs"]
 mod windows_conpty_reader;
 #[path = "windows_input.rs"]
@@ -28,7 +30,7 @@ use windows_input::InputWriter;
 use windows_job::Job;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
-use windows_sys::Win32::System::Console::{ResizePseudoConsole, COORD, HPCON};
+use windows_sys::Win32::System::Console::{COORD, HPCON};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, OpenProcess, ResumeThread, TerminateProcess,
@@ -37,7 +39,10 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
-use zellij_utils::{errors::prelude::*, input::command::RunCommand};
+use zellij_utils::{
+    errors::prelude::*,
+    input::{command::RunCommand, options::ConptyProvider},
+};
 
 // Not exported by windows-sys; value from the Windows SDK.
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x00020016;
@@ -326,13 +331,28 @@ fn terminate_process(pid: u32) -> std::result::Result<(), std::io::Error> {
 pub(crate) struct WindowsPtyBackend {
     terminals: Arc<Mutex<BTreeMap<u32, Option<Arc<ConPtyTerminal>>>>>,
     next_terminal_id_counter: Arc<AtomicU32>,
+    provider: Arc<OnceLock<Arc<windows_conpty_provider::Provider>>>,
 }
 
 impl WindowsPtyBackend {
+    // Backend clones are created before the first client's configuration arrives.
+    // Freeze one shared provider before session initialization spawns any panes.
+    pub(crate) fn configure_provider(&self, configured: Option<ConptyProvider>) {
+        self.provider
+            .get_or_init(|| windows_conpty_provider::Provider::from_config(configured));
+    }
+
+    fn provider(&self) -> Arc<windows_conpty_provider::Provider> {
+        self.provider
+            .get_or_init(|| windows_conpty_provider::Provider::from_config(None))
+            .clone()
+    }
+
     pub fn new() -> Result<Self, io::Error> {
         Ok(Self {
             terminals: Arc::new(Mutex::new(BTreeMap::new())),
             next_terminal_id_counter: Arc::new(AtomicU32::new(0)),
+            provider: Arc::new(OnceLock::new()),
         })
     }
 
@@ -362,12 +382,14 @@ impl WindowsPtyBackend {
         let mut flags = windows_conpty::selected_flags();
         let (console, reader, process, child_pid, job, input) = loop {
             let (console, reader) =
-                Console::create(80, 24, flags, bootstrap).with_context(|| {
-                    format!(
-                        "allocate ConPTY for {} (flags {flags:#x})",
-                        cmd.command.display()
-                    )
-                })?;
+                Console::create(80, 24, flags, bootstrap, self.provider()).with_context(
+                    || {
+                        format!(
+                            "allocate ConPTY for {} (flags {flags:#x})",
+                            cmd.command.display()
+                        )
+                    },
+                )?;
             let input = console.input.clone();
             // Reuse the allocated host for a permitted Job breakaway retry.
             // Creating a second host can itself exceed the enclosing Job quota
@@ -519,7 +541,7 @@ impl WindowsPtyBackend {
                         X: cols.min(i16::MAX as u16) as i16,
                         Y: rows.min(i16::MAX as u16) as i16,
                     };
-                    let hr = unsafe { ResizePseudoConsole(console.hpcon, size) };
+                    let hr = console.resize(size);
                     if hr != S_OK && !is_benign_resize_after_exit_hresult(hr) {
                         Err::<(), _>(anyhow!("ResizePseudoConsole failed: HRESULT 0x{:08x}", hr))
                             .with_context(err_context)

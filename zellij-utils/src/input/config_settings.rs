@@ -173,6 +173,8 @@ fn option_values(options: &Options, values: &mut BTreeMap<SettingKey, Option<Str
         session_indicator,
         swap_layout_notification,
         on_quit,
+        // Startup-only backend selection is not exposed as a live UI setting.
+        conpty_provider: _,
     } = options;
     let entries = [
         (SettingKey::SimplifiedUi, display_text(simplified_ui)),

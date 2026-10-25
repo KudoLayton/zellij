@@ -86,6 +86,7 @@ fn every_option_set() -> Options {
         session_indicator: Some(false),
         swap_layout_notification: Some(false),
         on_quit: Some(crate::input::options::OnQuit::Detach),
+        conpty_provider: None, // startup-only, not a live UI setting
     }
 }
 

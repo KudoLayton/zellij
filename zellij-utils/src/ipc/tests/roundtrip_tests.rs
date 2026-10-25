@@ -560,6 +560,7 @@ fn test_client_messages() {
                 session_indicator: Some(true),
                 swap_layout_notification: Some(false),
                 on_quit: Some(crate::input::options::OnQuit::AskDetach),
+                conpty_provider: Some(crate::input::options::ConptyProvider::Bundled),
             }),
             layout: None,
             terminal_window_size: Size { rows: 80, cols: 42 },

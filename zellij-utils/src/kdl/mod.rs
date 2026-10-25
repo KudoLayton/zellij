@@ -3488,7 +3488,18 @@ impl Options {
             None => None,
         };
 
+        let conpty_provider =
+            match kdl_property_first_arg_as_string_or_error!(kdl_options, "conpty_provider") {
+                Some((value, entry)) => Some(
+                    value
+                        .parse::<crate::input::options::ConptyProvider>()
+                        .map_err(|error| kdl_parsing_error!(error, entry))?,
+                ),
+                None => None,
+            };
+
         Ok(Options {
+            conpty_provider,
             simplified_ui,
             theme,
             theme_dark,
@@ -5495,6 +5506,26 @@ impl Options {
             None
         }
     }
+    fn conpty_provider_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
+        if self.conpty_provider.is_none() && !add_comments {
+            return None;
+        }
+        let mut node = KdlNode::new("conpty_provider");
+        node.push(KdlValue::String(
+            self.conpty_provider.unwrap_or_default().as_str().to_owned(),
+        ));
+        if add_comments {
+            let prefix = if self.conpty_provider.is_none() {
+                "// "
+            } else {
+                ""
+            };
+            node.set_leading(format!(
+                "\n// Windows only: system (default) or bundled (requires an installed trusted ConPTY pair).\n// Applies to new sessions only; ignored on other platforms.\n{prefix}"
+            ));
+        }
+        Some(node)
+    }
     pub fn to_kdl(&self, add_comments: bool) -> Vec<KdlNode> {
         let mut nodes = vec![];
         if let Some(simplified_ui_node) = self.simplified_ui_to_kdl(add_comments) {
@@ -5711,6 +5742,9 @@ impl Options {
         }
         if let Some(on_quit) = self.on_quit_to_kdl(add_comments) {
             nodes.push(on_quit);
+        }
+        if let Some(conpty_provider) = self.conpty_provider_to_kdl(add_comments) {
+            nodes.push(conpty_provider);
         }
         nodes
     }
@@ -10257,6 +10291,39 @@ fn nested_session_handling_kdl_round_trip_for_every_variant() {
         let reparsed =
             Options::from_kdl(&fake_document.to_string().parse::<KdlDocument>().unwrap()).unwrap();
         assert_eq!(parsed, reparsed, "round-trip mismatch for {value}");
+    }
+}
+
+#[test]
+fn conpty_provider_kdl_round_trip_and_validation() {
+    use crate::input::options::ConptyProvider;
+    for provider in [ConptyProvider::System, ConptyProvider::Bundled] {
+        let document: KdlDocument = format!("conpty_provider \"{}\"\n", provider.as_str())
+            .parse()
+            .unwrap();
+        let options = Options::from_kdl(&document).unwrap();
+        assert_eq!(options.conpty_provider, Some(provider));
+        for comments in [false, true] {
+            let mut serialized = KdlDocument::new();
+            serialized.nodes_mut().extend(options.to_kdl(comments));
+            let reparsed = Options::from_kdl(&serialized.to_string().parse().unwrap()).unwrap();
+            assert_eq!(reparsed, options);
+        }
+    }
+    assert_eq!(
+        Options::from_kdl(&KdlDocument::new()).unwrap().conpty_provider,
+        None
+    );
+    for invalid in [
+        "conpty_provider \"unknown\"\n",
+        "conpty_provider true\n",
+        "conpty_provider 1\n",
+        "conpty_provider\n",
+    ] {
+        assert!(
+            Options::from_kdl(&invalid.parse().unwrap()).is_err(),
+            "{invalid}"
+        );
     }
 }
 

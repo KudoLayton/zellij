@@ -1,8 +1,8 @@
 //! ConPTY allocation and fallback policy from KudoLayton/zellij b56a18ff3
 //! and e3ed549f2. Each failed spawn gets a fresh pseudo console and pipes.
 use super::{
-    windows_conpty_reader::ConPtyBlockingReader, windows_input::InputWriter,
-    windows_input_pipe::input_pipe,
+    windows_conpty_provider::Provider, windows_conpty_reader::ConPtyBlockingReader,
+    windows_input::InputWriter, windows_input_pipe::input_pipe,
 };
 use std::{
     io,
@@ -16,12 +16,15 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{HANDLE, S_OK},
     System::{
-        Console::{ClosePseudoConsole, CreatePseudoConsole, COORD, HPCON},
+        Console::{COORD, HPCON},
         Pipes::CreatePipe,
         SystemInformation::OSVERSIONINFOEXW,
     },
 };
 
+// Historical name/policy retained for the system provider only. This is NOT a
+// graphics bypass: current Microsoft headers assign bit 8 to glyph width.
+// Keep the compatibility override until the system policy is separately tested.
 pub(super) const PASSTHROUGH: u32 = 8;
 const BASE_FLAGS: u32 = 2 | 4;
 
@@ -79,6 +82,7 @@ pub(super) struct Console {
     pub(super) input: Arc<InputWriter>,
     pub(super) flags: u32,
     discard_on_close: Arc<AtomicBool>,
+    provider: Arc<Provider>,
 }
 
 // The handle is owned, and backend serializes resize/close operations.
@@ -89,9 +93,11 @@ impl Console {
     pub(super) fn create(
         cols: u16,
         rows: u16,
-        mut flags: u32,
+        flags: u32,
         bootstrap: bool,
+        provider: Arc<Provider>,
     ) -> io::Result<(Self, ConPtyBlockingReader)> {
+        let mut flags = provider.effective_flags(flags);
         loop {
             let (input_read, input_handle) = input_pipe(4096)?;
             let input = Arc::new(InputWriter::new(input_handle)?);
@@ -107,7 +113,7 @@ impl Console {
             };
             let mut hpcon = 0;
             let hr = unsafe {
-                CreatePseudoConsole(
+                provider.create(
                     size,
                     input_read.as_raw_handle() as HANDLE,
                     output_write.as_raw_handle() as HANDLE,
@@ -116,12 +122,17 @@ impl Console {
                 )
             };
             if hr == S_OK {
+                log::info!(
+                    "ConPTY provider={} effective_flags={flags:#x}",
+                    provider.description()
+                );
                 return Ok((
                     Self {
                         hpcon,
                         input,
                         flags,
                         discard_on_close,
+                        provider,
                     },
                     reader,
                 ));
@@ -139,6 +150,15 @@ impl Console {
         }
     }
 
+    pub(super) fn resize(&self, size: COORD) -> i32 {
+        unsafe { self.provider.resize(self.hpcon, size) }
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_bundled(&self) -> bool {
+        self.provider.is_bundled()
+    }
+
     pub(super) fn discard_signal(&self) -> Arc<AtomicBool> {
         self.discard_on_close.clone()
     }
@@ -149,7 +169,7 @@ impl Console {
         self.input.shutdown();
         if self.hpcon != 0 {
             let hpcon = std::mem::replace(&mut self.hpcon, 0);
-            unsafe { ClosePseudoConsole(hpcon) };
+            unsafe { self.provider.close(hpcon) };
         }
     }
 }

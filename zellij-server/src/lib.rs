@@ -3897,6 +3897,7 @@ pub fn start_server_impl(
                     },
                 };
 
+                os_input.configure_pty(&runtime_config_options);
                 info!("FirstClientConnected: initializing session");
                 let mut session = init_session(
                     os_input.clone(),

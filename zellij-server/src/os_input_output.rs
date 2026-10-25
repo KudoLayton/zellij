@@ -363,6 +363,9 @@ impl AsyncReader for NullAsyncReader {
 /// The `ServerOsApi` trait represents an abstract interface to the features of an operating system that
 /// Zellij server requires.
 pub trait ServerOsApi: Send + Sync {
+    /// Called once with the first client's resolved options, before any pane is spawned.
+    fn configure_pty(&self, _options: &zellij_utils::input::options::Options) {}
+
     fn set_terminal_size_using_terminal_id(
         &self,
         id: u32,
@@ -451,6 +454,11 @@ pub trait ServerOsApi: Send + Sync {
 }
 
 impl ServerOsApi for ServerOsInputOutput {
+    #[cfg(windows)]
+    fn configure_pty(&self, options: &zellij_utils::input::options::Options) {
+        self.pty_backend.configure_provider(options.conpty_provider);
+    }
+
     fn set_terminal_size_using_terminal_id(
         &self,
         id: u32,
