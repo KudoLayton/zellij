@@ -65,6 +65,8 @@ pub struct SixelGrid {
     previous_cell_size: Option<SizeInPixels>,
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
     currently_parsing: Option<SixelDeserializer>,
+    raster_height: Option<usize>,
+    transparent_background: bool,
     image_ids_to_reap: Vec<usize>,
     images_to_check_for_emptiness: HashSet<usize>,
     sixel_parser: Option<sixel_tokenizer::Parser>,
@@ -84,19 +86,45 @@ impl SixelGrid {
             ..Default::default()
         }
     }
+    fn deserialize_event(
+        deserializer: &mut SixelDeserializer,
+        raster_height: &mut Option<usize>,
+        transparent_background: &mut bool,
+        event: SixelEvent,
+    ) {
+        match &event {
+            SixelEvent::RasterAttribute { pv, .. } => *raster_height = *pv,
+            SixelEvent::Dcs {
+                transparent_background: background,
+                ..
+            } => *transparent_background = *background == Some(1),
+            _ => {},
+        }
+        let _ = deserializer.handle_event(event);
+    }
     pub fn handle_byte(&mut self, byte: u8) {
         self.sixel_parser
             .as_mut()
             .unwrap()
             .advance(&byte, |sixel_event| {
                 if let Some(currently_parsing) = self.currently_parsing.as_mut() {
-                    let _ = currently_parsing.handle_event(sixel_event);
+                    Self::deserialize_event(
+                        currently_parsing,
+                        &mut self.raster_height,
+                        &mut self.transparent_background,
+                        sixel_event,
+                    );
                 }
             });
     }
     pub fn handle_event(&mut self, sixel_event: SixelEvent) {
         if let Some(currently_parsing) = self.currently_parsing.as_mut() {
-            let _ = currently_parsing.handle_event(sixel_event);
+            Self::deserialize_event(
+                currently_parsing,
+                &mut self.raster_height,
+                &mut self.transparent_background,
+                sixel_event,
+            );
         }
     }
     pub fn is_parsing(&self) -> bool {
@@ -109,6 +137,8 @@ impl SixelGrid {
         dcs_params: Vec<&[u16]>,
     ) {
         self.sixel_parser = Some(sixel_tokenizer::Parser::new());
+        self.raster_height = None;
+        self.transparent_background = false;
         match max_height_in_pixels {
             Some(max_height_in_pixels) => {
                 self.currently_parsing =
@@ -152,7 +182,27 @@ impl SixelGrid {
         // usize is image_id
         self.sixel_parser = None;
         if let Some(sixel_deserializer) = self.currently_parsing.as_mut() {
-            if let Ok(sixel_image) = sixel_deserializer.create_image() {
+            if let Ok(mut sixel_image) = sixel_deserializer.create_image() {
+                // sixel-image allocates complete six-row bands, including off
+                // pixels in the last band. For transparent images with a declared
+                // height, that padding can add a cell to cursor advancement and
+                // scroll an otherwise fitting preview. Remove only that final
+                // partial band's transparent padding, not real pixels or whole
+                // bands beyond Pv: raster attributes are not a clipping region.
+                if let Some(height) = self.raster_height.filter(|height| *height > 0) {
+                    let allocated_height = sixel_image.pixels.len();
+                    let padding = allocated_height.saturating_sub(height);
+                    if self.transparent_background
+                        && (1..6).contains(&padding)
+                        && allocated_height % 6 == 0
+                        && sixel_image.pixels[height..]
+                            .iter()
+                            .flatten()
+                            .all(|pixel| !pixel.on)
+                    {
+                        sixel_image.pixels.truncate(height);
+                    }
+                }
                 let image_pixel_size = sixel_image.pixel_size();
                 let image_size_and_coordinates = PixelRect::new(
                     x_pixel_coordinates,

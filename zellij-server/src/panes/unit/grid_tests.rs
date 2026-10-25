@@ -3504,6 +3504,53 @@ pub fn sixel_images_are_reaped_when_resetting() {
 }
 
 #[test]
+fn sixel_partial_band_preserves_alternate_screen_after_resize() {
+    let mut grid = create_grid_with_size_and_raw(14, 95, b"\x1b[?1049h");
+    *grid.character_cell_size.borrow_mut() = Some(SizeInPixels {
+        width: 10,
+        height: 20,
+    });
+    grid.change_size(12, 86);
+    feed_bytes(&mut grid, b"\x1b[2J\x1b[1;1HHEADER\x1b[12;1HSTATUS");
+    let before = viewport_texts(&grid);
+    // A 200px image occupies ten 20px cells. The last sixel band has
+    // only two painted rows; its four padding rows must not scroll HEADER.
+    let image = format!(
+        "\x1b[s\x1b[2;55H\x1bP9;1q\"1;1;1;200#1;2;100;0;0#1{}B\x1b\\\x1b[u",
+        "~-".repeat(33)
+    );
+    feed_bytes(&mut grid, image.as_bytes());
+    assert_eq!(viewport_texts(&grid), before);
+    let (_, rect) = grid.sixel_grid.image_coordinates().next().unwrap();
+    assert_eq!(rect.height, 200);
+}
+
+#[test]
+fn sixel_partial_band_trims_only_declared_transparent_padding() {
+    let (mut grid, _) = new_kitty_grid(20, 60);
+    // Reuse the parser owner so missing raster attributes cannot inherit Pv
+    // from the preceding image. Painted/opaque pixels and extra whole bands
+    // beyond Pv are intentional content, not padding to clip.
+    for (case, background, raster, data, expected_height) in [
+        ("partial", 1, "\"1;1;1;2", "B", 2),
+        ("no raster", 1, "", "B", 6),
+        ("zero height", 1, "\"1;1;1;0", "B", 6),
+        ("painted beyond Pv", 1, "\"1;1;1;2", "~", 6),
+        ("extra whole band", 1, "\"1;1;1;2", "B-?", 12),
+        ("opaque background", 0, "\"1;1;1;2", "B", 6),
+        ("transparent blank", 1, "\"1;1;1;2", "?", 2),
+        ("aligned height", 1, "\"1;1;1;6", "~", 6),
+    ] {
+        let image = format!(
+            "\x1b[2J\x1b[3;1H\x1bP9;{background}q{raster}#1;2;100;0;0#1{data}\x1b\\"
+        );
+        feed_bytes(&mut grid, image.as_bytes());
+        let (_, rect) = grid.sixel_grid.image_coordinates().next().unwrap();
+        assert_eq!(rect.height, expected_height, "{case}");
+    }
+}
+
+#[test]
 pub fn sixel_image_in_alternate_buffer() {
     let mut vte_parser = vte::Parser::new();
     let sixel_image_store = Rc::new(RefCell::new(SixelImageStore::default()));
